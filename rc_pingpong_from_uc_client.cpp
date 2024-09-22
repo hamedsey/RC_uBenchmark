@@ -94,6 +94,7 @@ enum {
 	NC = 8,
 	EXP = 9,
 	PCR = 10,
+	RR = 11,
 };
 
 struct ibv_device      **dev_list;
@@ -128,6 +129,7 @@ uint64_t distribution_mode = 0;
 uint64_t priority_distribution_mode = 0;
 
 uint64_t connPerThread = 0;
+uint8_t *expectedSeqNum;
 
 #if SHARED_CQ
 struct ibv_cq **sharedCQ;
@@ -138,7 +140,7 @@ uint64_t gen_latency(int mean, int mode, int isMeasThread, uint64_t *serviceTime
 	if(isMeasThread == 1) return mean;
 	//else if (mode == FIXED) return mean;
 	else {
-		static uint16_t index = 0;
+		static uint64_t index = 0;
 		uint64_t result = serviceTime[index];
 		//printf("index = %lu, OR  = %lu \n",index,SERVICE_TIME_SIZE | index);
 		//if( (SERVICE_TIME_SIZE | index) == 0xFFFF) {
@@ -173,6 +175,15 @@ inline uint16_t gen_priority(uint16_t *priorityID) {
 		//printf("index = %lu \n",index);
 		index++;
 	}
+
+	/*
+	uint64_t * countofPriority = (uint64_t*)malloc(numConnections*(sizeof(uint64_t)));
+	for(int o = 0; o < SERVICE_TIME_SIZE; o++) countofPriority[priorityID[o]]++;
+
+	for(int o = 0; o < numConnections; o++) printf("%llu  ", countofPriority[o]);
+	printf("\n");
+	*/
+
 	return result;
 }
 
@@ -628,13 +639,14 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 	}
 
 	#if SHARED_CQ
-		if(ctx->id % connPerThread == 0)
+		if(ctx->id % connPerThread == 0) {
 			//printf("created sharedCQ, connid = %llu \n", ctx->id);
 			sharedCQ[ctx->id/(connPerThread)] = ibv_create_cq(ctx->context, (connPerThread)*(2*rx_depth + 1), NULL, ctx->channel, 0);
 			if (!sharedCQ[ctx->id/(connPerThread)]) {
 				fprintf(stderr, "Couldn't create CQ\n");
 				goto clean_cq;
 			}
+		}
 	#else
 		ctx->cq = ibv_create_cq(ctx->context, 2*rx_depth + 1, NULL, ctx->channel, 0);
 		if (!ctx->cq) {
@@ -849,7 +861,7 @@ static int pp_post_send(struct pingpong_context *ctx, bool signal)
 	struct ibv_send_wr wr;
 	memset(&wr, 0, sizeof(wr));
 
-	wr.wr_id	    = ctx->rx_depth;
+	wr.wr_id	  = ctx->rx_depth;
 	wr.sg_list    = &list;
 	wr.num_sge    = 1;
 	wr.opcode     = IBV_WR_SEND;
@@ -1006,25 +1018,28 @@ void* threadfunc(void* x) {
 		uint16_t twentyPercent = 0;
 		uint16_t eightyPercent = numQueuesGettingMoreLoad;
 
+		std::uniform_int_distribution<uint64_t>* ur20 = new std::uniform_int_distribution<uint64_t>(0, numQueuesGettingMoreLoad-1);
+		std::uniform_int_distribution<uint64_t>* ur80 = new std::uniform_int_distribution<uint64_t>(numQueuesGettingMoreLoad, numConnections-1);
+
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
 			if(bm(gen) == 0) {
-				priorityID[i] = twentyPercent;//8*twentyPercent;
-				if(twentyPercent == numQueuesGettingMoreLoad-1) twentyPercent = 0;
-				else twentyPercent++;
+				priorityID[i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
+				//if(twentyPercent == numQueuesGettingMoreLoad-1) twentyPercent = 0;
+				//else twentyPercent++;
 			}
 			else {
-				priorityID[i] = eightyPercent;//8*eightyPercent;
-				if(eightyPercent == numConnections-1/*7*/) eightyPercent = numQueuesGettingMoreLoad;
-				else eightyPercent++;
+				priorityID[i] = (*ur80)(gen);//eightyPercent;//8*eightyPercent;
+				//if(eightyPercent == numConnections-1/*7*/) eightyPercent = numQueuesGettingMoreLoad;
+				//else eightyPercent++;
 			}
 		}
 	}
 	else if(priority_distribution_mode == SQ) {
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
-			//priorityID[i] = numConnections-1;
-			priorityID[i] = thread_id*connPerThread;
+			priorityID[i] = numConnections-1;
+			//priorityID[i] = thread_id*connPerThread;
 		}
 	}
 	else if(priority_distribution_mode == NC) {
@@ -1115,21 +1130,30 @@ void* threadfunc(void* x) {
 		uint16_t twentyPercent = 0;
 		uint16_t eightyPercent = numQueuesGettingMoreLoad;
 
+		std::uniform_int_distribution<uint64_t>* ur20 = new std::uniform_int_distribution<uint64_t>(0, numQueuesGettingMoreLoad-1);
+		std::uniform_int_distribution<uint64_t>* ur80 = new std::uniform_int_distribution<uint64_t>(numQueuesGettingMoreLoad, numConnections-1);
+
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
 			if(bm(gen) == 0) {
-				priorityID[i] = numConnections-1-twentyPercent;//8*twentyPercent;
-				if(twentyPercent == numQueuesGettingMoreLoad-1) twentyPercent = 0;
-				else twentyPercent++;
+				priorityID[i] = numConnections-1-(*ur20)(gen);//twentyPercent;//8*twentyPercent;
+				//if(twentyPercent == numQueuesGettingMoreLoad-1) twentyPercent = 0;
+				//else twentyPercent++;
 			}
 			else {
-				priorityID[i] = numConnections-1-eightyPercent;//8*eightyPercent;
-				if(eightyPercent == numConnections-1/*7*/) eightyPercent = numQueuesGettingMoreLoad;
-				else eightyPercent++;
+				priorityID[i] = numConnections-1-(*ur80)(gen);//eightyPercent;//8*eightyPercent;
+				//if(eightyPercent == numConnections-1/*7*/) eightyPercent = numQueuesGettingMoreLoad;
+				//else eightyPercent++;
 			}
 		}
 	}
-
+	else if(priority_distribution_mode == RR) {
+		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
+			//printf("result = %d \n",result);
+			priorityID[i] = i%numConnections;
+			//priorityID[i] = thread_id*connPerThread;
+		}
+	}
 
 
 	if (gettimeofday(&start, NULL)) {
@@ -1137,29 +1161,40 @@ void* threadfunc(void* x) {
 		return 0;
 	}
 
-	struct pingpong_context *ctx = ctxs[offset];
-	//printf("rx_depth = %llu \n", ctx->rx_depth);
-
 	//reduce logic
 	//get rid of send completions
 	//poll less items
+	
+	//uint64_t prio_prev = 0;
+	struct pingpong_context *ctx = ctxs[0];
+	printf("rx_depth = %llu \n", ctx->rx_depth);
 
 	uint16_t signalInterval = 8192 - ctx->rx_depth;
 	printf("signalInterval = %llu \n", signalInterval);
 
-
+	/*
 	uint8_t *expectedSeqNum = (uint8_t*)malloc(numConnections*sizeof(uint8_t));
 	for(uint64_t g = 0; g < numConnections; g++) expectedSeqNum[g] = 0;
+	
 	uint64_t *outOfOrderNum = (uint64_t*)malloc(numConnections*sizeof(uint64_t));
 	for(uint64_t g = 0; g < numConnections; g++) outOfOrderNum[g] = 0;
+	*/
 
-	uint8_t *firstOne = (uint8_t*)malloc(numConnections*sizeof(uint8_t));
-	for(uint64_t g = 0; g < numConnections; g++) firstOne[g] = 1;
+	//uint8_t *firstOne = (uint8_t*)malloc(numConnections*sizeof(uint8_t));
+	//for(uint64_t g = 0; g < numConnections; g++) firstOne[g] = 1;
 
 	struct timespec ttime,curtime;
 	clock_gettime(CLOCK_MONOTONIC,&ttime);
-	uint64_t prio_prev;
 	uint64_t index = 0;
+
+	
+	uint64_t * countofPriority = (uint64_t*)malloc(numConnections*(sizeof(uint64_t)));
+	for(int o = 0; o < SERVICE_TIME_SIZE; o++) countofPriority[priorityID[o]]++;
+
+	for(int o = 0; o < numConnections; o++) printf("%llu  ", countofPriority[o]);
+	printf("\n");
+	
+
 	while (1) {
 			//compare to previous version that was save
 			//try adding shared CQ
@@ -1176,13 +1211,19 @@ void* threadfunc(void* x) {
 		uint16_t priority = /*(*bm)(gen);*/ gen_priority(priorityID);
 
 		//printf("T %llu , priority = %llu \n",thread_id, priority);
-		if(priority != prio_prev) ctx = ctxs[priority];
+		//if(priority != prio_prev) 
+		ctx = ctxs[priority];
 		//printf("souts = %llu, rcnt = %llu, ctx->rx_depth = %llu \n", ctx->souts, ctx->rcnt, ctx->rx_depth);
 		//if (servername && (ctx->souts - (ctx->scnt*signalInterval) < signalInterval)) {
+		//prio_prev = priority;
+
 		if (servername && (ctx->souts - ctx->rcnt < ctx->rx_depth)) {
 
 			uint64_t req_lat = mean;//gen_latency(mean, distribution_mode, 0, serviceTime);
 			req_lat = req_lat >> 4;
+			//printf("lat = %d \n",req_lat); 
+
+
 			#if MEAS_GEN_LAT 
 				printf("lat = %d \n",req_lat); 
 			#endif
@@ -1191,18 +1232,22 @@ void* threadfunc(void* x) {
 			//printf("sleep_int_lower = %lu, sleep_int_upper = %lu, sleep_time = %lu \n", lat_lower, lat_upper, req_lat);
 
 			//service time
-			if(firstOne[priority] == 1) {
-				ctx->buf_send[0] = 128; //128, 192
-				firstOne[priority] = 0;
-			}
-			else ctx->buf_send[0] = 0; //0, 64
+			//if(firstOne[priority] == 1) {
+			//	ctx->buf_send[0] = 128; //128, 192
+			//	firstOne[priority] = 0;
+			//}
+			//else 
+			ctx->buf_send[0] = 0; //0, 64
 
 			ctx->buf_send[11] = (uint8_t)(req_lat & ((1u <<  8) - 1));
 			ctx->buf_send[10] = (uint8_t)((req_lat >> 8) & ((1u <<  8) - 1));
 			
+			//printf("sleep_int_lower = %llu \n",(uint8_t)ctx->buf_send[11]);
+			//printf("sleep_int_upper = %llu \n",(uint8_t)ctx->buf_send[10]);
+
 			//sequence number
 			ctx->buf_send[12] = ctx->nextSequenceNumToSend;
-			
+			//ctx->buf_send[19] = priority;
 			if(ctx->nextSequenceNumToSend == 255) ctx->nextSequenceNumToSend = 0;
 			else ctx->nextSequenceNumToSend++;
 
@@ -1222,18 +1267,25 @@ void* threadfunc(void* x) {
 				//printf("send posted ... \n");
 			}
 
+			
+			//success = pp_post_write(ctx, (ctx->souts%signalInterval == 0), 0);
 			/*
-			success = pp_post_write(ctx, (ctx->souts%signalInterval == 0), 0);
-			if (success == EINVAL) printf("Invalid value provided in wr \n");
-			else if (success == ENOMEM)	printf("Send Queue is full or not enough resources to complete this operation \n");
-			else if (success == EFAULT) printf("Invalid value provided in qp \n");
-			else if (success != 0) {
-				printf("success = %d, \n",success);
-				fprintf(stderr, "Couldn't post send 3 \n");
-				//return 1;
-			}
-			else {
-				//printf("send posted ... \n");
+			if(ctx->souts == 1) {
+				//if(ctx->souts % 2 == 0) 
+				(res.buf)[0] = 255;
+				//else (res.buf)[0] = 255;
+				success = post_send(&res, IBV_WR_RDMA_WRITE, priority);
+				if (success == EINVAL) printf("Invalid value provided in wr \n");
+				else if (success == ENOMEM)	printf("Send Queue is full or not enough resources to complete this operation \n");
+				else if (success == EFAULT) printf("Invalid value provided in qp \n");
+				else if (success != 0) {
+					printf("success = %d, \n",success);
+					fprintf(stderr, "Couldn't post send 3 \n");
+					//return 1;
+				}
+				else {
+					//printf("write posted ... \n");
+				}
 			}
 			*/
 			countSendPriority[thread_id][priority]++;
@@ -1311,14 +1363,16 @@ void* threadfunc(void* x) {
 				//printf("connID = %llu , qpn = %llu \n", connID, wc[i].qp_num);
 
 				//handling userspace sequence number
+				/*
 				if(expectedSeqNum[connID] != (uint8_t)ctx->buf_recv[wrID][12]) {
-					//printf("conn %llu ... received sequence %llu ... expected %llu \n", connID, (uint8_t)ctx->buf_recv[wrID][12], expectedSeqNum[connID]);
-					outOfOrderNum[connID]++;
+					printf("conn %llu ... received sequence %llu ... expected %llu \n", connID, (uint8_t)ctx->buf_recv[wrID][12], expectedSeqNum[connID]);
+					//outOfOrderNum[connID]++;
 				}
 				else //printf("conn %llu ... received sequence %llu = expected %llu \n", connID, (uint8_t)ctx->buf_recv[wrID][12], expectedSeqNum[connID]);
 
 				if(expectedSeqNum[connID] == 255) expectedSeqNum[connID] = 0;
 				else expectedSeqNum[connID]++;
+				*/
 				//handling userspace sequence number
 
 				assert(pp_post_recv(ctx, wrID) == 0);
@@ -1348,7 +1402,6 @@ void* threadfunc(void* x) {
 				return 0;
 			}
 		}
-		prio_prev = priority;
 	}
 
 	ctx = ctxs[offset];
@@ -1363,13 +1416,22 @@ void* threadfunc(void* x) {
 	printf("%d iters in %.5f seconds, rps = %f \n", rcnt, usec/1000000., rps[thread_id]);
 
 
+	
+	uint64_t * countofPriorityAgain = (uint64_t*)malloc(numConnections*(sizeof(uint64_t)));
+	for(int o = 0; o < SERVICE_TIME_SIZE; o++) countofPriorityAgain[priorityID[o]]++;
+
+	for(int o = 0; o < numConnections; o++) printf("%llu  ", countofPriorityAgain[o]);
+	printf("\n");
+
 	//printf("\n\nprinting sequence number stats \n.\n.\n.\n");
+	/*
 	uint64_t totalOutOfOrderNum = 0;
 	for(uint64_t h = 0; h < numConnections; h++) {
 		//printf("%llu  ", outOfOrderNum[h]);
 		totalOutOfOrderNum += outOfOrderNum[h];
 	}
 	printf("\nT%d totalOutOfOrderNum = %llu \n", thread_id, totalOutOfOrderNum);
+	*/
 	//printf(".\n.\n.\nend of sequence number stats ... \n");
 
 	//printf("%lld bytes in %.2f seconds = %.2f Mbit/sec\n", bytes, usec / 1000000., bytes * 8. / usec);
@@ -1645,6 +1707,9 @@ int main(int argc, char *argv[])
 		for(int g = 0; g < numConnections; g++) countSendPriority[t][g] = 0;
 	}
 
+	expectedSeqNum = (uint8_t *)malloc(numConnections*sizeof(uint8_t));
+	for(int c = 0; c < numConnections; c++) expectedSeqNum[c] = 0;
+
 	//if(servername == NULL) numThreads = 1;
     for(int x = 0; x < numThreads; x++) {
 		struct thread_data *tdata = (struct thread_data *)malloc(sizeof(struct thread_data));
@@ -1674,6 +1739,7 @@ int main(int argc, char *argv[])
 	uint64_t *totalPerThread = (uint64_t *)malloc(numThreads*sizeof(uint64_t));
 	for(int t = 0; t < numThreads; t++) totalPerThread[t] = 0;
 
+	printf("total received per connection ... \n");
 	for(int g = 0; g < numConnections; g++) {
 		printf("P%llu   ",g);
 
@@ -1684,7 +1750,7 @@ int main(int argc, char *argv[])
 		printf("\n");
 	}		
 	printf("\n");
-	printf("total per thread ... \n");
+	printf("total received per thread ... \n");
 	for(int t = 0; t < numThreads; t++){
 		printf("%llu   ",totalPerThread[t]);
 	}
@@ -1695,9 +1761,9 @@ int main(int argc, char *argv[])
 	uint64_t *totalSendPerThread = (uint64_t *)malloc(numThreads*sizeof(uint64_t));
 	for(int t = 0; t < numThreads; t++) totalSendPerThread[t] = 0;
 
+	printf("total sent per connection ... \n");
 	for(int g = 0; g < numConnections; g++) {
 		printf("P%llu   ",g);
-
 		for(int t = 0; t < numThreads; t++){
 			totalSendPerThread[t] += countSendPriority[t][g];
 			printf("%llu    ",countSendPriority[t][g]);
@@ -1705,7 +1771,7 @@ int main(int argc, char *argv[])
 		printf("\n");
 	}		
 	printf("\n");
-	printf("total send per thread ... \n");
+	printf("total sent per thread ... \n");
 	for(int t = 0; t < numThreads; t++){
 		printf("%llu   ",totalSendPerThread[t]);
 	}

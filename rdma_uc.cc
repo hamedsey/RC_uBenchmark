@@ -94,7 +94,7 @@ struct resources {
     struct ibv_cq *cq;                  // CQ handle
     struct ibv_qp *qp;                  // QP handle
     struct ibv_mr *mr;                  // MR handle for buf
-    volatile char *buf;                 // memory buffer pointer, used for
+    volatile char * buf;                 // memory buffer pointer, used for
     /*
     volatile char *buf2;                 // memory buffer pointer, used for
     volatile char *buf3;                 // memory buffer pointer, used for
@@ -283,7 +283,7 @@ static int post_send(struct resources *res, ibv_wr_opcode opcode, int offset) {
 
     if (opcode != IBV_WR_SEND) {
         sr.wr.rdma.remote_addr = res->remote_props.addr + offset;
-        printf("remote addr = %x \n", sr.wr.rdma.remote_addr);
+        printf("remote addr = 0x%" PRIx64 "\n", sr.wr.rdma.remote_addr);
         sr.wr.rdma.rkey = res->remote_props.rkey;
     }
 
@@ -995,7 +995,7 @@ int do_uc(char *dev_name, char *server_name, uint32_t tcp_port, int ib_port, int
         // first we read contents of server's buffer
         //post_send(&res, IBV_WR_RDMA_READ);
         //poll_completion(&res);
-        sleep(4);
+        //sleep(4);
 
         printf("Contents of server's buffer: %llu \n", *(res.buf));
 
@@ -1006,8 +1006,8 @@ int do_uc(char *dev_name, char *server_name, uint32_t tcp_port, int ib_port, int
         (res.buf)[3] = 0; //64;
         INFO("Now replacing it with: %llu \n", htonll(*(res.buf)));
         post_send(&res, IBV_WR_RDMA_WRITE, 0);
-        sleep(2);
-        poll_completion(&res);
+        //sleep(2);
+        //poll_completion(&res);
 
         (res.buf)[0] = 0; //64;
         (res.buf)[1] = 2; //64;
@@ -1016,24 +1016,24 @@ int do_uc(char *dev_name, char *server_name, uint32_t tcp_port, int ib_port, int
         
         INFO("Now replacing it with: %llu \n", htonll(*(res.buf)));
         post_send(&res, IBV_WR_RDMA_WRITE, 1);
-        sleep(2);
-        poll_completion(&res);
+        //sleep(2);
+        //poll_completion(&res);
 
         (res.buf)[0] = 0; //64;
         (res.buf)[1] = 0; //64;
         (res.buf)[2] = 3; //64;
         (res.buf)[3] = 0; //64;        INFO("Now replacing it with: %llu \n", htonll(*(res.buf)));
         post_send(&res, IBV_WR_RDMA_WRITE, 2);
-        sleep(2);
-        poll_completion(&res);
+        //sleep(2);
+        //poll_completion(&res);
 
         (res.buf)[0] = 0; //64;
         (res.buf)[1] = 0; //64;
         (res.buf)[2] = 0; //64;
         (res.buf)[3] = 4; //64;        INFO("Now replacing it with: %llu \n", htonll(*(res.buf)));
         post_send(&res, IBV_WR_RDMA_WRITE, 3);
-        sleep(2);
-        poll_completion(&res);
+        //sleep(2);
+        //poll_completion(&res);
         
         /*
         uint64_t p = 0;
@@ -1056,17 +1056,20 @@ int do_uc(char *dev_name, char *server_name, uint32_t tcp_port, int ib_port, int
         //unsigned long long i = 0;
         //unsigned long long i = 0;
         while(1) {
-            INFO("Contents of server buffer: %llu \n", *(res.buf));
-            sleep(1);
+            //INFO("Contents of server buffer: %llu \n", *(res.buf));
+            //sleep(1);
             //printf("buf = %llu , leading zeros = %llu \n", *(res.buf), __builtin_clz(*(res.buf)));
             int y = 0;
+            /*
             for(y = 0; y < 4 ; y++) {
                 printf("buf[%d] = %llu  ", y, (res.buf)[y]);
             }
+            
             printf("\n");
+            */
             //if(i == 0) i++;
             //else i = i * 2;
-            if((res.buf)[3] == 4) break;
+            if((res.buf)[0] == 1 && (res.buf)[1] == 2 && (res.buf)[2] == 3 && (res.buf)[3] == 4) break;
         }
     }
 

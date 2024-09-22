@@ -1,3 +1,4 @@
+//byte vector better than sharedCQ
 // TO COMPILE
 //TO RUN
 //./RCC_Client -d mlx5_0 -s 20 -r 20 -g 3 -l 1000000 192.168.1.5 -z 5 -n 8 -t 1
@@ -73,11 +74,12 @@
 #define SERVICE_TIME_SIZE 0x8000
 
 #define MAX_QUEUES 1024
-#define SHARED_CQ 1
+#define SHARED_CQ 0
 #define RC 1
 #define ENABLE_SERV_TIME 1
-#define FPGA_NOTIFICATION 0
+#define FPGA_NOTIFICATION 1
 #define debugFPGA 0
+#define bitVector 1
 
 struct ibv_device      **dev_list;
 struct ibv_device	*ib_dev;
@@ -104,6 +106,8 @@ uint64_t goalLoad = 0;
 uint64_t numThreads = 0;
 
 uint64_t connPerThread = 0;
+
+uint8_t *expectedSeqNum;
 
 #if SHARED_CQ
 struct ibv_cq **sharedCQ;
@@ -216,7 +220,7 @@ struct thread_data {
 };
 
 void my_sleep(uint64_t n) {
-	//printf("mysleep = %llu \n",n);
+	//if(n == 10000) printf("mysleep = %llu \n",n);
 	struct timespec ttime,curtime;
 	clock_gettime(CLOCK_MONOTONIC,&ttime);
 	
@@ -575,13 +579,14 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 	}
 
 	#if SHARED_CQ
-		if(ctx->id % connPerThread == 0)
+		if(ctx->id % connPerThread == 0) {
 			//printf("created sharedCQ,  %llu \n", ctx->id);
 			sharedCQ[ctx->id/(connPerThread)] = ibv_create_cq(ctx->context, (connPerThread)*(2*rx_depth + 1), NULL, ctx->channel, 0);
 			if (!sharedCQ[ctx->id/(connPerThread)]) {
 				fprintf(stderr, "Couldn't create CQ\n");
 				goto clean_cq;
 			}
+		}
 	#else
 		ctx->cq = ibv_create_cq(ctx->context, 2*rx_depth + 1, NULL, ctx->channel, 0);
 		if (!ctx->cq) {
@@ -811,6 +816,7 @@ static int pp_post_send(struct pingpong_context *ctx, bool signal)
 	return ibv_post_send(ctx->qp, &wr, &bad_wr);
 }
 
+/*
 static int pp_post_write(struct pingpong_context *ctx, bool signal, uint64_t offset)
 {
 	struct ibv_sge list;// = {
@@ -842,6 +848,7 @@ static int pp_post_write(struct pingpong_context *ctx, bool signal, uint64_t off
 
 	return ibv_post_send(ctx->qp, &wr, &bad_wr);
 }
+*/
 
 static void usage(const char *argv0)
 {
@@ -875,18 +882,12 @@ void* threadfunc(void* x) {
 	//#else
 	uint64_t offset = (numConnections/numThreads) * thread_id;
 	//#endif
-	unsigned int rcnt, scnt = 0;
+	unsigned int rcnt = 0, scnt = 0;
 	uint64_t wrID;
-	struct pingpong_context *ctx = ctxs[offset];
+	struct pingpong_context *ctx = ctxs[0];
 	//OFFSET IS THE CONNECTION ID
 
-	#if SHARED_CQ
-		struct ibv_wc wc[connPerThread*2*rx_depth];
-		//struct ibv_wc wc[1];
-	#else
-		struct ibv_wc wc[2*ctx->rx_depth];
-		//struct ibv_wc wc[1];
-	#endif
+	struct ibv_wc wc[1];
 	
 	int ne, i;
 
@@ -915,7 +916,11 @@ void* threadfunc(void* x) {
 	//}
 	*/
 
+	uint64_t mean = (uint64_t)2E3;
+	uint64_t sleep_time = 1000;
+
 	#if FPGA_NOTIFICATION
+		/*
 		uint32_t *processBufB4Polling = (uint32_t*) malloc(numConnections*sizeof(uint32_t)); 
 		for(int q = 0; q < numConnections; q++) {
 			//processBufB4Polling[q] = (uint32_t*) malloc(sizeof(uint32_t));
@@ -926,6 +931,7 @@ void* threadfunc(void* x) {
 			//processBufB4PollingSrcQP[q] = (uint32_t*) malloc(sizeof(uint32_t));
 		//	processBufB4PollingSrcQP[q] = NULL;
 		//}
+		*/
 		//uint32_t offset = 0;		
 		unsigned long long leadingZeros = 0;
 		//alignas(64) uint64_t result[8] = {0,0,0,0,0,0,0,0};
@@ -934,20 +940,33 @@ void* threadfunc(void* x) {
 
 		//__m512i sixtyfour = _mm512_setr_epi64(64, 64, 64, 64, 64, 64, 64, 64);
 		//uint64_t log2;
-		uint64_t value;
+		//uint64_t value;
 		//uint64_t byteOffset;
 		//uint64_t leadingZerosinValue;
-		uint8_t resultIndexWorkFound;
+		//uint8_t resultIndexWorkFound;
 		//uint64_t bufID;
-		uint64_t received = false;
+		//uint64_t received = false;
 
-		uint64_t startOffset = 4096*thread_id;
-		uint64_t endOffset = startOffset + numConnections;
-		uint64_t leftOff = startOffset;
+		//uint64_t startOffset = 4096*thread_id;
+		//uint64_t endOffset = startOffset + numConnections;
+		//uint64_t leftOff = startOffset;
 
+		uint64_t prevOffset = 0;
 		uint64_t notificationExistsButNoPacket = 0;
 		uint64_t idlePollsBeforeFindingWork = 0;
-		bool haveNotPolled = true;
+		//bool haveNotPolled = true;
+
+		//bool currentState = false;
+
+		uint64_t lzcntsaysworkbutactuallynotthere = 0;
+		bool foundWork = false;
+		uint64_t ii = 0;
+		uint64_t counting = 0;
+		uint64_t no_work_found_idle_polls = 0;
+		//uint64_t alliterations = 0;
+
+		bool exit = false;
+		ctx = ctxs[prevOffset];
 	#endif
 
 	if (gettimeofday(&start, NULL)) {
@@ -958,120 +977,347 @@ void* threadfunc(void* x) {
 	uint16_t signalInterval = (8192 - ctx->rx_depth)/4;
 	printf("signalInterval = %llu \n", signalInterval);
 
-	/*
-	uint8_t *expectedSeqNum = (uint8_t*)malloc(numConnections*sizeof(uint8_t));
-	for(uint64_t g = 0; g < numConnections; g++) expectedSeqNum[g] = 0;
-	uint64_t *outOfOrderNum = (uint64_t*)malloc(numConnections*sizeof(uint64_t));
-	for(uint64_t g = 0; g < numConnections; g++) outOfOrderNum[g] = 0;
-	*/
+	uint64_t connection8Active = 0;
+	uint64_t connection9Active = 0;
 
-	while (1) {
-		//if(ctx->id == 1 && servername) break;
 
-		if (gettimeofday(&end, NULL)) {
-			perror("gettimeofday");
-			return 0;
-		}
+	while (1) { //exit == false) {
 
-		//runtime
-		if(end.tv_sec - start.tv_sec > 10) break;
+			//my_sleep(uint64_t(3E2)); //647kRPS
 
-		//if(thread_id != 0) continue;
+			//alliterations++;
+			if (gettimeofday(&end, NULL)) {
+				perror("gettimeofday");
+				return 0;
+			}
 
-		#if !SHARED_CQ && !FPGA_NOTIFICATION
-		if(servername == NULL) {
-			ctx = ctxs[offset];
-		}
-		#endif
-		
-		//if(thread_id == 0) {
-		//	for(uint64_t y = 0; y < 4096 * (numThreads+1) ; y++) if((res.buf)[y] != 0x00) printf("%llu , %x  \n ", y, (res.buf)[y]);
-		//}
-		
-		//for(uint64_t y = startOffset; y < endOffset ; y++) {
-		//	if((res.buf)[y] != 0x00) printf("y = %d,  %x  ", y, (res.buf)[y]);
-		//}
-		
-		/////////////////////////////////Multi Queue - lzcnt //////////////////////////////////////////////
-		#if FPGA_NOTIFICATION
-			bool foundWork = false;
-			#if 1
-			//uint32_t byteFlipMask = 0x00000000;
-			//printf("entering lzcnt loop \n");
-			for (int i = leftOff; i < endOffset; i += 8) {
+			//runtime
+			if(end.tv_sec - start.tv_sec > 10) {
+				printf("finished 10 seconds \n");	
+				//exit = true;
+				break;
+			}
 
-				unsigned long long value = htonll(*reinterpret_cast<volatile unsigned long long*>(res.buf + i));
-				__asm__ __volatile__ ("lzcnt %1, %0" : "=r" (leadingZeros) : "r" (value):);
+			#if !SHARED_CQ && !FPGA_NOTIFICATION
+			if(servername == NULL) {
+				ctx = ctxs[offset];
+			}
+			#endif
+
+			
+			//for(uint64_t y = 0; y < 4 ; y++) printf("%x  ", (res.buf)[y]);
+			//printf("\n\n");
+
+			#if FPGA_NOTIFICATION
+			/////////////////////////////////Multi Queue - lzcnt //////////////////////////////////////////////
+			foundWork = false;
+
+			//for (int i = 0; i < endOffset; i += 8) {
+			#if bitVector
+			ii+=8;
+			if(ii*8 >= numConnections) { //compare against upperbound for numConnections*8 to make code identical
+				ii = 0;
+				//if(numConnections > 512) __asm__ __volatile__ ("clflush (%0)" :: "r"(res.buf));
+			}
+			#else
+			ii+=8;
+			if(ii >= numConnections) ii = 0;
+			//rewrite code for byte vector like bit vector
+			/*
+			if(numConnections > 64 && (ii & 0x0000003F) == 0 && ii < numConnections - 64 ) {
+				__asm__ __volatile__ ("clflush (%0)" :: "r"(res.buf + ii));
+				//printf("invalidated cache line. ii = %llu \n", ii);
+			}
+			*/
+			#endif
 				
-				//leadingZeros = __builtin_clzll(value); 
-				//leadingZeros = _lzcnt_u64(value);
-
-				#if debugFPGA
-				if(leadingZeros < 64) {
-					printf("T%d - LZCNT - leading count = %llu, value = %llu \n", thread_id, leadingZeros, value);
-					for(uint64_t y = 0; y < 8 ; y++) {
-						printf("%x  ", (res.buf)[i + y]);
-					}
-					printf("\n");
-				}
-				#endif
-				//printf("leading count = %llu, value = %llu \n", leadingZeros, value);
-
-				//printf("\n \n");
-				//printf("offset = %llu \n", offset);
-
-				if(leadingZeros != 64) {
-					//printf("leading zeros is %llu \n", leadingZeros);
-					offset = i + (leadingZeros >> 3) - startOffset; //this value will change depending on leading zeros
-					foundWork = true;
-					
-					//printf("thread %d - found work, offset is %llu \n", thread_id , offset);
-					
-					#if debugFPGA
-					printf("T%d - LZCNT - found work, offset (connid) is %llu \n", thread_id, offset);
-					for(uint64_t y = 0; y < 16 ; y++) printf("%x  ", (res.buf)[y]);
-					printf("\n");
-					#endif
-					//usleep(100);
-					ctx = ctxs[offset];
-					//sequenceNumberInBV = (res.buf)[offset];
-					//printf("initially, leftOff = %llu \n", leftOff);
-					(res.buf)[offset + startOffset] = 0x00;
-					leftOff = offset + startOffset+ 1;
-					if(leftOff >= endOffset) leftOff = startOffset;
-					//printf("after changing, leftOff = %llu \n", leftOff);
-					//printf("offset = %llu \n", offset);
-					if(processBufB4Polling[offset] != NULL) {
-						#if debugFPGA
-						printf("T%d - BACKFILL - found work item from previous iter, process that \n", thread_id);
-						#endif
+			unsigned long long value = htonll(*reinterpret_cast<volatile unsigned long long*>(res.buf + ii));
 						
-						//printf("thread %d - found work in backfill, offset is %llu \n", thread_id , offset);
+			//printf("ii = %llu \n", ii);
 
-						wrID = (processBufB4Polling[offset]);
-						received = true;
-						//printf("idle polls = %llu , rcnt = %llu \n", idlePolls, connections[0]->rcnt);
+			#if FPGA_NOTIFICATION
+			while(value != 0) {
+			#endif
 
-						ctx->rcnt++;
-						rcnt++;
+			__asm__ __volatile__ ("lzcnt %1, %0" : "=r" (leadingZeros) : "r" (value):);  //register allocated
+			//__asm__ __volatile__ ("clflush (%0)" :: "r"(res.buf));
 
+			//the reason the gap does not exist is that the expensive operation of getting the cache block from memory is the same for both bit and byte vector
+			//128 queues
+			
+			//Byte vector 128 byte (two cache blocks)
+				//fetch from memory, bring into cache, 4x instructions + 4x instructions
+			//Bit vector 128 bits (one cache block)
+				//fetch from memory, bring into cache, x instructions
+			//both access one "slow" cache block
+			//if we invalidate the cache block that's not being changed we'd expect the gap to grow between bit/byte vector
+
+			//leadingZeros = __builtin_clzll(value);
+
+			//my_sleep(uint64_t(3E2)); //656kRPS
+			//if(uint8_t(res.buf[8]) == 0xFF) connection8Active++;
+			//if(uint8_t(res.buf[9]) == 0xFF) connection9Active++;
+			
+			#if bitVector
+			//printf("ii = %llu , value = %llu, leadingzeros = %llu \n", ii, (uint64_t)value, leadingZeros);
+			value = value & (uint64_t)(0x7FFFFFFFFFFFFFFF >> leadingZeros);
+			//uint64_t shiftStartValue = 0x7FFFFFFFFFFFFFFF;
+
+			//int result;
+
+			 // Right shift 'shiftStartValue' by 'leadingZeros'
+			 // Output: shiftStartValue is updated after the shift
+			 // Input: leadingZeros specifies how much to shift
+
+			/*
+			__asm__ __volatile__ (
+				"shr %[leadingZeros], %[shiftStartValue]"  
+				: [shiftStartValue] "+r" (shiftStartValue)         
+				: [leadingZeros] "r" ((uint8_t)leadingZeros) 
+			);
+			*/
+
+
+			/*
+			__asm__ __volatile__ (
+				"mov %[leadingZeros], %%cl;"  				// Move shift amount to 'cl'
+				"shr %%cl, %[shiftStartValue]"         		// Shift 'shiftStartValue' right by the amount in 'cl'
+				: [shiftStartValue] "=r" (shiftStartValue)      		// Output: result after the shift
+				: "[shiftStartValue]" (shiftStartValue),    // Input: shiftStartValue to shift
+				[leadingZeros] "r" (leadingZeros) 			// Input: shift amount
+				: "%cl"                      				// cl is modified, so we need to mention it here
+			);
+			*/
+			// Inline assembly block
+			// Shift 'shiftStartValue' right by 'leadingZeros', shiftStartValue = shiftStartValue >> leadingZeros
+			// Perform 'value = value & shiftStartValue'
+			// Output: result is stored back in 'value'
+			// Input: shiftStartValue that will be used as the mask after the shift
+			// Input: leadingZeros
+			/*
+			__asm__ __volatile__ (
+				"shr %[leadingZeros], %[shiftStartValue];"   
+				"and %[shiftStartValue], %[value];"         
+				: [value] "+r" (value)           			
+				: [shiftStartValue] "r" (shiftStartValue),  
+				[leadingZeros] "r" (leadingZeros) 			
+			);
+			*/
+
+			//0x3FFFFFFFFFFFFFFF
+			//0x1FFFFFFFFFFFFFFF
+			//0x0FFFFFFFFFFFFFFF
+			//if(leadingZeros != 64) {
+				offset = (ii << 3) + leadingZeros;
+
+				foundWork = true;
+				//printf("offset = %llu \n", offset);
+				//if(prevOffset != offset) {
+					ctx = ctxs[offset];
+				//	prevOffset = offset;
+					//printf("hi \n");
+				//}
+			//}
+			/*
+			else {
+				//printf("assert \n");
+				assert(true);
+				//ii = ii+8;//%numConnections;
+				//foundWork = false;
+				//no_work_found_idle_polls++;
+				continue;
+			}
+			*/
+			#else
+
+			//printf("ii = %llu, leading zeros = %llu \n", ii, leadingZeros);
+			/*
+			if(leadingZeros != 64) {
+			//if(uint8_t(res.buf[0]) == 255) {
+				offset = ii + (leadingZeros >> 3);// - startOffset; //this value will change depending on leading zeros
+				//printf("i is %llu \n", i);
+				//printf("startOffset is %llu \n", startOffset);
+				//printf("offset is %llu \n", offset);
+			
+				//my_sleep(uint64_t(3E2)); //648kRPS
+
+				foundWork = true;
+				counting++;
+				ii = ii+(leadingZeros >> 3)+1;//%numConnections;
+				//printf("thread %d - found work, offset is %llu \n", thread_id , offset);
+
+				ctx = ctxs[offset];
+
+				//leftOff = offset + startOffset+ 1;
+				//if(leftOff >= endOffset) leftOff = startOffset;
+				
+				//break;
+			}
+			else {
+				//my_sleep(sleep_time);  //backing off for 1ns
+				//usleep(1);
+				//my_sleep(uint64_t(3E2)); //444RPS
+				ii = ii+8;//%numConnections;
+				foundWork = false;
+				no_work_found_idle_polls++;
+				continue;
+			}
+			*/
+
+			
+			//printf("ii = %llu , value = %llu, leadingzeros = %llu \n", ii, (uint64_t)value, leadingZeros);
+
+			value = value & (uint64_t)(0x00FFFFFFFFFFFFFF >> leadingZeros);
+			offset = ii + (leadingZeros >> 3);// - startOffset; //this value will change depending on leading zeros
+
+			foundWork = true;
+			//printf("thread %d - found work, offset is %llu \n", thread_id , offset);
+
+			ctx = ctxs[offset];
+			
+
+
+			assert(foundWork == true);
+			#endif
+			#endif
+
+			//printf("after lzcnt for loop \n");
+			
+			//CPU doesn't see update value... add prints or cut the statements in the code
+			//if using bits instead of bytes, need to use a bit mask to check the next queue in that read byte which has work (read 8 byte value once only)
+
+			//my_sleep(uint64_t(3E2)); //245RPS, 213kRPS
+
+		
+			//if(foundWork == false) {
+				/*
+				if(currentState == true) {
+					//printf("1 -> 0 \n");
+					currentState = false;
+				}
+				*/
+				//printf("did not find work \n");
+				//my_sleep(sleep_time);
+
+				//my_sleep(uint64_t(3E2)); //118RPS
+			//	continue;
+			//}
+
+
+			#if SHARED_CQ
+				//ne = ibv_poll_cq(sharedCQ[thread_id], connPerThread*2*ctx->rx_depth, wc);
+				ne = ibv_poll_cq(sharedCQ[thread_id], 1, wc);
+				//printf("after poll cq \n");
+			#else
+				//ne = ibv_poll_cq(ctx->cq, 2*ctx->rx_depth, wc);
+				ne = ibv_poll_cq(ctx->cq, 1, wc);
+			#endif
+
+			//printf("after polling \n");
+
+			//if(servername) printf("polling \n");
+
+			//my_sleep(uint64_t(3E2)); //620kRPS
+
+			if (ne < 0) {
+				fprintf(stderr, "poll CQ failed %d\n", ne);
+				return 0;
+			}
+
+			#if FPGA_NOTIFICATION
+			if(foundWork == true && ne == 0) lzcntsaysworkbutactuallynotthere++;
+			#endif
+
+			for (i = 0; i < ne; ++i) {
+				if (wc[i].status != IBV_WC_SUCCESS) {
+					fprintf(stderr, "Failed status %s (%d) for wr_id %d\n", ibv_wc_status_str(wc[i].status),wc[i].status, (int) wc[i].wr_id);
+					return 0;
+				}
+				wrID = (uint64_t) wc[i].wr_id;
+
+				#if SHARED_CQ
+					uint64_t offset = wc[i].qp_num & (MAX_QUEUES-1);
+					//printf("offset = %llu , qpn = %llu \n", offset, wc[i].qp_num);
+					ctx = ctxs[offset];
+				#endif
+
+				if(wrID == ctx->rx_depth) {
+					//++ctx->scnt;
+					//scnt++;
+					//printf("send complete ... scnt = %llu \n", ctx->scnt);
+					//my_sleep(uint64_t(3E2)); //75RPS
+				}
+				else if (wrID >= 0 && wrID < ctx->rx_depth) {
+
+					ctx->rcnt++;
+					rcnt++;
+
+					#if FPGA_NOTIFICATION
+						//received = true;
+						//printf("thread %d - found work in first poll, offset is %llu \n", thread_id , offset);
+
+						//printf("found work in poll, offset = %llu \n", offset);
+						#if debugFPGA
+						printf("T%d - FIRST POLL - found work, offset = %llu \n", thread_id, offset);
+						#endif
+					#endif
+
+					#if SHARED_CQ
 						countPriority[thread_id][offset]++;
+					#else
+						countPriority[thread_id][offset]++;
+					#endif
+					//uint8_t sleep_int_lower = (uint8_t)ctx->buf_recv[wrID][11];
+					//uint8_t sleep_int_upper = (uint8_t)ctx->buf_recv[wrID][10];	
+					//printf("recv complete ... rcnt = %llu \n", ctx->rcnt);
 
-						if(servername == NULL) {
-							uint64_t sleep_time = ((uint8_t)ctx->buf_recv[wrID][11] + (uint8_t)ctx->buf_recv[wrID][10] * 0x100) << 4;
-							//my_sleep((uint64_t)1E3);
-							my_sleep(sleep_time);
-							memcpy(ctx->buf_send,ctx->buf_recv[wrID],size);
+					if(servername == NULL) {
+						sleep_time = ((uint8_t)ctx->buf_recv[wrID][11] + (uint8_t)ctx->buf_recv[wrID][10] * 0x100) << 4;
+						//my_sleep((uint64_t)2E3);
+
+						/*
+						if(offset != (uint8_t)ctx->buf_recv[wrID][19]) {
+							printf("offset = %lu , priority = %lu \n", offset, (uint8_t)ctx->buf_recv[wrID][19]);
+							assert(offset == (uint8_t)ctx->buf_recv[wrID][19]);
 						}
+						*/
+					
+						#if ENABLE_SERV_TIME
+						//printf("sleep_time = %llu \n",sleep_time);
+						//printf("sleep_int_lower = %llu \n",(uint8_t)ctx->buf_recv[wrID][11]);
+						//printf("sleep_int_upper = %llu \n",(uint8_t)ctx->buf_recv[wrID][10]);
+						assert(sleep_time == 992);
+						my_sleep(sleep_time);
+						memcpy(ctx->buf_send,ctx->buf_recv[wrID],size);
+						#endif
+					}
 
-						assert(pp_post_recv(ctx, wrID) == 0);
-						if (ctx->routs < ctx->rx_depth) {
-							fprintf(stderr,
-								"Couldn't post receive (%d)\n", ctx->routs);
-							return 0;
-						}
+					assert(pp_post_recv(ctx, wrID) == 0);
+					if (ctx->routs < ctx->rx_depth) {
+						fprintf(stderr,
+							"Couldn't post receive (%d)\n", ctx->routs);
+						return 0;
+					}
 
+					//printf("offset = %llu , qpn = %llu \n", offset, wc[i].qp_num);
+
+					//handling userspace sequence number
+					/*
+					if(expectedSeqNum[offset] != (uint8_t)ctx->buf_recv[wrID][12]) {
+						printf("conn %llu ... received sequence %llu ... expected %llu \n", offset, (uint8_t)ctx->buf_recv[wrID][12], expectedSeqNum[offset]);
+						//outOfOrderNum[offset]++;
+					}
+					else //printf("conn %llu ... received sequence %llu = expected %llu \n", offset, (uint8_t)ctx->buf_recv[wrID][12], expectedSeqNum[offset]);
+
+					if(expectedSeqNum[offset] == 255) expectedSeqNum[offset] = 0;
+					else expectedSeqNum[offset]++;
+					*/
+					//handling userspace sequence number
+
+					//for(int hi = 0; hi < 1; hi++) {
 						uint64_t success = pp_post_send(ctx, (ctx->scnt%signalInterval == 0));
+						assert(success == 0);
+						/*
 						if (success == EINVAL) printf("Invalid value provided in wr \n");
 						else if (success == ENOMEM)	printf("Send Queue is full or not enough resources to complete this operation \n");
 						else if (success == EFAULT) printf("Invalid value provided in qp \n");
@@ -1083,269 +1329,36 @@ void* threadfunc(void* x) {
 						else {
 							//printf("send posted ... sentCount = %llu, scnt = %llu \n", sentCount, conn->scnt);
 						}
+						*/
 						scnt++;
 						ctx->scnt++;
-						//printf("found valid backfill ... going to pollAgain \n");
-						#if debugFPGA
-						printf("T%d - BACKFILL - found valid backfill ... going to poll again \n", thread_id);
-						#endif
-						goto pollAgain;
-					}
-					else {
-						#if debugFPGA
-							printf("T%d - LZCNT/BACKFILL - found work in connid %llu, but no backfill \n", thread_id, offset);
-						#endif
-					} 
-					break;
-				}
-			}
-			//printf("after lzcnt for loop \n");
-			if(foundWork == false) {
-				//printf("did not find work \n");
-				continue;
-			}
-			//else {
-			//printf("going to poll first time \n");
-			//}
-			#endif
-		#endif
-		/*
-		if (servername) {
-			//for(uint64_t z = 0; z < ctx[y]->rx_depth; z++) {
-			uint64_t success = pp_post_send(ctx);
-			if (success == EINVAL) printf("Invalid value provided in wr \n");
-			else if (success == ENOMEM)	printf("Send Queue is full or not enough resources to complete this operation \n");
-			else if (success == EFAULT) printf("Invalid value provided in qp \n");
-			else if (success != 0) {
-				printf("success = %d, \n",success);
-				fprintf(stderr, "Couldn't post send 3 \n");
-				//return 1;
-			}
-			else {
-				//printf("send posted ... z = %llu \n", z);
-			}
-			//double interArrivalWaitTime = ran_expo(1/1000);
-			//printf("%f \n", interArrivalWaitTime);
-
-			uint64_t arrival_wait_time = gen_arrival_time(arrivalSleepTime);
-			my_sleep(arrival_wait_time);
-		}
-		*/
-
-		#if FPGA_NOTIFICATION
-		haveNotPolled = true;
-		while(received == false) {
-		#endif
-
-		//printf("\n\n");
-
-		#if SHARED_CQ
-			//ne = ibv_poll_cq(sharedCQ[thread_id], connPerThread*2*ctx->rx_depth, wc);
-			ne = ibv_poll_cq(sharedCQ[thread_id], 1, wc);
-			//printf("after poll cq \n");
-		#else
-			//ne = ibv_poll_cq(ctx->cq, 2*ctx->rx_depth, wc);
-			ne = ibv_poll_cq(ctx->cq, 1, wc);
-		#endif
-
-		//if(servername) printf("polling \n");
-		if (ne < 0) {
-			fprintf(stderr, "poll CQ failed %d\n", ne);
-			return 0;
-		}
-
-		#if FPGA_NOTIFICATION
-		//if (ne < 1) continue;
-		if(ne == 0 && haveNotPolled == true) {
-			notificationExistsButNoPacket++;
-			haveNotPolled = false;
-		}
-		#endif
-
-		for (i = 0; i < ne; ++i) {
-			if (wc[i].status != IBV_WC_SUCCESS) {
-				fprintf(stderr, "Failed status %s (%d) for wr_id %d\n", ibv_wc_status_str(wc[i].status),wc[i].status, (int) wc[i].wr_id);
-				return 0;
-			}
-			wrID = (uint64_t) wc[i].wr_id;
-			
-
-			#if SHARED_CQ
-				uint64_t offset = wc[i].qp_num & (MAX_QUEUES-1);
-				//printf("offset = %llu , qpn = %llu \n", offset, wc[i].qp_num);
-				ctx = ctxs[offset];
-			#endif
-
-			if(wrID == ctx->rx_depth) {
-				//++ctx->scnt;
-				//scnt++;
-				//printf("send complete ... scnt = %llu \n", ctx->scnt);
-			}
-			else if (wrID >= 0 && wrID < ctx->rx_depth) {
-
-				ctx->rcnt++;
-				rcnt++;
-
-				#if FPGA_NOTIFICATION
-					received = true;
-					//printf("thread %d - found work in first poll, offset is %llu \n", thread_id , offset);
-
-					//printf("found work in first poll, offset = %llu \n", offset);
-					#if debugFPGA
-					printf("T%d - FIRST POLL - found work, offset = %llu \n", thread_id, offset);
-					#endif
-				#endif
-
-				#if SHARED_CQ
-					countPriority[thread_id][offset]++;
-				#else
-					countPriority[thread_id][offset]++;
-				#endif
-				//uint8_t sleep_int_lower = (uint8_t)ctx->buf_recv[wrID][11];
-				//uint8_t sleep_int_upper = (uint8_t)ctx->buf_recv[wrID][10];	
-				//printf("recv complete ... rcnt = %llu \n", ctx->rcnt);
-
-				if(servername == NULL) {
-					uint64_t sleep_time = ((uint8_t)ctx->buf_recv[wrID][11] + (uint8_t)ctx->buf_recv[wrID][10] * 0x100) << 4;
-					//my_sleep((uint64_t)1E3);
-
-					#if ENABLE_SERV_TIME
-					//printf("sleep_time = %llu \n",sleep_time);
-					assert(sleep_time == 992);
-					my_sleep(sleep_time);
-					memcpy(ctx->buf_send,ctx->buf_recv[wrID],size);
-					#endif
-				}
-
-				assert(pp_post_recv(ctx, wrID) == 0);
-				if (ctx->routs < ctx->rx_depth) {
-					fprintf(stderr,
-						"Couldn't post receive (%d)\n", ctx->routs);
-					return 0;
-				}
-
-				//printf("offset = %llu , qpn = %llu \n", offset, wc[i].qp_num);
-
-				//handling userspace sequence number
-				/*
-				if(expectedSeqNum[offset] != (uint8_t)ctx->buf_recv[wrID][12]) {
-					//printf("conn %llu ... received sequence %llu ... expected %llu \n", offset, (uint8_t)ctx->buf_recv[wrID][12], expectedSeqNum[offset]);
-					outOfOrderNum[offset]++;
-				}
-				else //printf("conn %llu ... received sequence %llu = expected %llu \n", offset, (uint8_t)ctx->buf_recv[wrID][12], expectedSeqNum[offset]);
-
-				if(expectedSeqNum[offset] == 255) expectedSeqNum[offset] = 0;
-				else expectedSeqNum[offset]++;
-				*/
-				//handling userspace sequence number
-
-				uint64_t success = pp_post_send(ctx, (ctx->scnt%signalInterval == 0));
-				if (success == EINVAL) printf("Invalid value provided in wr \n");
-				else if (success == ENOMEM)	printf("Send Queue is full or not enough resources to complete this operation \n");
-				else if (success == EFAULT) printf("Invalid value provided in qp \n");
-				else if (success != 0) {
-					printf("success = %d, \n",success);
-					fprintf(stderr, "Couldn't post send 3 \n");
-					//return 1;
-				}
-				else {
-					//printf("send posted ... sentCount = %llu, scnt = %llu \n", sentCount, conn->scnt);
-				}
-				scnt++;
-				ctx->scnt++;
-			}
-			else {
-				fprintf(stderr, "Completion for unknown wr_id %d\n",(int) wc[i].wr_id);
-				return 0;
-			}
-		}
-
-		#if FPGA_NOTIFICATION
-		if(received == false && ne == 0) idlePollsBeforeFindingWork++;
-
-		if(received == false) {
-			(res.buf)[offset + startOffset] = 0xFF;
-			continue;
-		}
-		#endif
-
-		#if FPGA_NOTIFICATION 
-		}
-		#endif
-
-		#if !SHARED_CQ && !FPGA_NOTIFICATION		
-		if(servername == NULL) {
-			//if(offset == numConnections-1) offset = 0;
-			//else offset++;
-
-			if(offset == ((numConnections/numThreads) * (thread_id+1)) -1) offset = (numConnections/numThreads) * thread_id;
-			else offset++;
-			
-		}
-		#endif
-
-		#if FPGA_NOTIFICATION
-		pollAgain:
-		bool foundRecv = false;
-		for(int iter = 0; iter < 2; iter++) {
-		//while (foundRecv == false || ne > 0) {
-			//printf("hello, ne = %d \n", ne);
-			if(foundRecv == true) break;
-			ne = ibv_poll_cq(ctx->cq, 1, wc);
-
-			//if(servername) printf("polling \n");
-			if (ne < 0) {
-				fprintf(stderr, "poll CQ failed %d\n", ne);
-				return 0;
-			}
-
-			//if (ne < 1) continue;
-
-			for (i = 0; i < ne; ++i) {
-				if (wc[i].status != IBV_WC_SUCCESS) {
-					fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
-						ibv_wc_status_str(wc[i].status),
-						wc[i].status, (int) wc[i].wr_id);
-					return 0;
-				}
-				wrID = (uint64_t) wc[i].wr_id;
-				
-				if(wrID == ctx->rx_depth) {
-					//hello
-				}
-				else if (wrID >= 0 && wrID < ctx->rx_depth) {
-					processBufB4Polling[offset] = wrID;
-					//printf("found work when polling again, offset is %llu \n", offset);
-					#if debugFPGA
-					printf("T%d - SECOND POLL - found work, offset (connid) is %llu \n", thread_id, offset);
-					for(uint64_t y = 0; y < 16 ; y++) printf("%x  ", (res.buf)[y]);
-					printf("\n");
-					#endif
-
-					//printf("thread %d - found work after second poll, offset is %llu \n", thread_id , offset);
-
-					(res.buf)[offset + startOffset] = 0xFF;
-					#if debugFPGA
-					printf("T%d - SECOND POLL - found work (printing after setting byte), offset is %llu \n", thread_id, offset);
-					for(uint64_t y = 0; y < 16 ; y++) printf("%x  ", (res.buf)[y]);
-					printf("\n");
-					#endif
-					foundRecv = true;
+						//my_sleep(uint64_t(3E2)); //635kRPS
+					//}
 				}
 				else {
 					fprintf(stderr, "Completion for unknown wr_id %d\n",(int) wc[i].wr_id);
 					return 0;
 				}
 			}
-		}
-		//printf("after polling again, foundRecv = %d \n", foundRecv);
-		if(foundRecv == false) processBufB4Polling[offset] = NULL;
-		#if debugFPGA
-		printf("T%d - SECOND POLL - foundRecv = %d \n", thread_id, foundRecv);
-		for(uint64_t y = 0; y < 16 ; y++) printf("%x  ", (res.buf)[y]);
-		printf("\n \n");
-		#endif
-		#endif
+
+			#if !SHARED_CQ && !FPGA_NOTIFICATION		
+			if(servername == NULL) {
+				//if(offset == numConnections-1) offset = 0;
+				//else offset++;
+
+				if(offset == ((numConnections/numThreads) * (thread_id+1)) -1) offset = (numConnections/numThreads) * thread_id;
+				else offset++;
+				
+			}
+			#endif
+					
+			#if FPGA_NOTIFICATION
+			//printf("hi \n");
+			}
+			//ii+=8;
+			//if(ii >= numConnections) ii = 0;
+			
+			#endif
 	}
 
 	ctx = ctxs[offset];
@@ -1362,6 +1375,10 @@ void* threadfunc(void* x) {
 	#else
 	printf("T %d, %d iters in %.5f seconds, rps = %f  \n", thread_id, rcnt, usec/1000000., rps[thread_id]);
 	#endif
+	
+	printf("connection 8 active = %llu \n", connection8Active);
+	printf("connection 9 active = %llu \n", connection9Active);
+
 	/*
 	//printf("\n\nprinting sequence number stats \n.\n.\n.\n");
 	uint64_t totalOutOfOrderNum = 0;
@@ -1380,6 +1397,15 @@ void* threadfunc(void* x) {
 	//free(ctx->rem_dest);
 
 	//end of thread operations
+
+	#if FPGA_NOTIFICATION
+	printf("counting = %llu \n", counting);
+	printf("lzcntsaysworkbutactuallynotthere = %llu \n", lzcntsaysworkbutactuallynotthere);
+	printf("no_work_found_idle_polls = %llu \n", no_work_found_idle_polls);
+	//printf("alliterations = %llu \n", alliterations);
+	#endif
+
+	return 0;
 }
 
 int main(int argc, char *argv[])
@@ -1617,13 +1643,16 @@ int main(int argc, char *argv[])
 	all_scnts = (uint32_t*)malloc(numThreads*sizeof(uint32_t));
 	countPriority = (uint64_t **)malloc(numThreads*sizeof(uint64_t *));
 
-	for(int t = 0; t < numThreads; t++) {
+	expectedSeqNum = (uint8_t *)malloc(numConnections*sizeof(uint8_t));
+	for(int c = 0; c < numConnections; c++) expectedSeqNum[c] = 0;
+
+	for(uint16_t t = 0; t < numThreads; t++) {
 		countPriority[t] = (uint64_t *)malloc(numConnections*sizeof(uint64_t));
-		for(int g = 0; g < numConnections; g++) countPriority[t][g] = 0;
+		for(uint16_t g = 0; g < numConnections; g++) countPriority[t][g] = 0;
 	}
 
 	//if(servername == NULL) numThreads = 1;
-    for(int x = 0; x < numThreads; x++) {
+    for(uint16_t x = 0; x < numThreads; x++) {
 		struct thread_data *tdata = (struct thread_data *)malloc(sizeof(struct thread_data));
 
 		tdata->ctxs = ctx;
@@ -1632,7 +1661,7 @@ int main(int argc, char *argv[])
 		assert(ret == 0);
 	}
 
-    for(int x = 0; x < numThreads; x++) {
+    for(uint16_t x = 0; x < numThreads; x++) {
         int ret = pthread_join(pt[x], NULL);
         assert(!ret);
     }
@@ -1640,7 +1669,7 @@ int main(int argc, char *argv[])
 	uint32_t total_rcnt = 0;
 	uint32_t total_scnt = 0;
 
-	for(int i = 0; i < numThreads; i++){
+	for(uint16_t i = 0; i < numThreads; i++){
 		//printf("allrcnt[%d] = %llu \n", i, all_rcnts[i]);
 		total_rcnt += all_rcnts[i];
 		total_scnt += all_scnts[i];
@@ -1648,12 +1677,12 @@ int main(int argc, char *argv[])
 
 
 	uint64_t *totalPerThread = (uint64_t *)malloc(numThreads*sizeof(uint64_t));
-	for(int t = 0; t < numThreads; t++) totalPerThread[t] = 0;
+	for(uint16_t t = 0; t < numThreads; t++) totalPerThread[t] = 0;
 
-	for(int g = 0; g < numConnections; g++) {
+	for(uint16_t g = 0; g < numConnections; g++) {
 		printf("P%llu   ",g);
 
-		for(int t = 0; t < numThreads; t++){
+		for(uint16_t t = 0; t < numThreads; t++){
 			totalPerThread[t] += countPriority[t][g];
 			printf("%llu    ",countPriority[t][g]);
 		}
@@ -1661,14 +1690,14 @@ int main(int argc, char *argv[])
 	}		
 	printf("\n");
 	printf("total per thread ... \n");
-	for(int t = 0; t < numThreads; t++){
+	for(uint16_t t = 0; t < numThreads; t++){
 		printf("%llu   ",totalPerThread[t]);
 	}
 	printf("\n");
 	printf("total rcnt = %d, total scnt = %d \n",(int)total_rcnt,(int)total_scnt);
 
 
-	for(int i = 0; i < numThreads; i++){
+	for(uint16_t i = 0; i < numThreads; i++){
 		printf("rps = %f \n",rps[i]);
 		totalRPS += rps[i];
 	}
