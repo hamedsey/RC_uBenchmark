@@ -74,12 +74,14 @@
 #define SERVICE_TIME_SIZE 0x8000
 
 #define MAX_QUEUES 1024
-#define SHARED_CQ 0
+#define SHARED_CQ 1
 #define RC 1
 #define ENABLE_SERV_TIME 1
-#define FPGA_NOTIFICATION 1
+#define FPGA_NOTIFICATION 0
 #define debugFPGA 0
 #define bitVector 1
+
+#define SHARE_SHAREDCQs 0
 
 struct ibv_device      **dev_list;
 struct ibv_device	*ib_dev;
@@ -918,6 +920,7 @@ void* threadfunc(void* x) {
 
 	uint64_t mean = (uint64_t)2E3;
 	uint64_t sleep_time = 1000;
+	uint64_t foundEmptyQueue = 0;
 
 	#if FPGA_NOTIFICATION
 		/*
@@ -980,6 +983,9 @@ void* threadfunc(void* x) {
 	uint64_t connection8Active = 0;
 	uint64_t connection9Active = 0;
 
+#if SHARE_SHAREDCQs
+	uint64_t sharedCQIndex = thread_id;
+#endif
 
 	while (1) { //exit == false) {
 
@@ -993,7 +999,7 @@ void* threadfunc(void* x) {
 
 			//runtime
 			if(end.tv_sec - start.tv_sec > 10) {
-				printf("finished 10 seconds \n");	
+				//printf("finished 10 seconds \n");	
 				//exit = true;
 				break;
 			}
@@ -1014,13 +1020,13 @@ void* threadfunc(void* x) {
 
 			//for (int i = 0; i < endOffset; i += 8) {
 			#if bitVector
-			ii+=8;
+			//ii+=8;
 			if(ii*8 >= numConnections) { //compare against upperbound for numConnections*8 to make code identical
 				ii = 0;
 				//if(numConnections > 512) __asm__ __volatile__ ("clflush (%0)" :: "r"(res.buf));
 			}
 			#else
-			ii+=8;
+			//ii+=8;
 			if(ii >= numConnections) ii = 0;
 			//rewrite code for byte vector like bit vector
 			/*
@@ -1031,9 +1037,26 @@ void* threadfunc(void* x) {
 			*/
 			#endif
 				
-			unsigned long long value = htonll(*reinterpret_cast<volatile unsigned long long*>(res.buf + ii));
+			unsigned long long value = htonll(*reinterpret_cast<volatile unsigned long long*>(res.buf + ii + (4096*thread_id)));
 						
 			//printf("ii = %llu \n", ii);
+			//printf("T %llu = %llu \n", ii);
+			//if(value == 0xC000000000000000) printf("T%llu \n", thread_id);
+				
+			//bool bothareone = false;
+			//if((uint8_t)res.buf[0] == 128 && (uint8_t)res.buf[4096] == 128) bothareone = true;
+			//printf("thread %llu - bothareone = true \n", thread_id);
+			//assert(bothareone == true);
+
+			//printf("T%llu: 
+			//for(int pp = 0; pp < numConnections; pp++)
+			
+			//if((uint8_t)res.buf[(4096*thread_id)] != 0) printf("T%llu: %llu \n",thread_id, (uint8_t)res.buf[(4096*thread_id)]);
+			//if( ((uint8_t)res.buf[4096] == 255 && (uint8_t)res.buf[0] == 255) || ((uint8_t)res.buf[4097] == 255 && (uint8_t)res.buf[1] == 255)) {
+			//	printf("hi \n");
+			//	assert(false);
+			//}
+
 
 			#if FPGA_NOTIFICATION
 			while(value != 0) {
@@ -1206,7 +1229,14 @@ void* threadfunc(void* x) {
 
 			#if SHARED_CQ
 				//ne = ibv_poll_cq(sharedCQ[thread_id], connPerThread*2*ctx->rx_depth, wc);
-				ne = ibv_poll_cq(sharedCQ[thread_id], 1, wc);
+							
+				#if SHARE_SHAREDCQs
+					ne = ibv_poll_cq(sharedCQ[sharedCQIndex], 1, wc);
+					sharedCQIndex++;
+					if(sharedCQIndex == numThreads) sharedCQIndex = 0;
+				#else
+					ne = ibv_poll_cq(sharedCQ[thread_id], 1, wc);
+				#endif
 				//printf("after poll cq \n");
 			#else
 				//ne = ibv_poll_cq(ctx->cq, 2*ctx->rx_depth, wc);
@@ -1281,6 +1311,9 @@ void* threadfunc(void* x) {
 							assert(offset == (uint8_t)ctx->buf_recv[wrID][19]);
 						}
 						*/
+
+						if ((uint8_t)ctx->buf_recv[wrID][0] >= 128) foundEmptyQueue++; //printf("T%llu - conn %llu is empty \n", thread_id, offset);
+
 					
 						#if ENABLE_SERV_TIME
 						//printf("sleep_time = %llu \n",sleep_time);
@@ -1315,8 +1348,10 @@ void* threadfunc(void* x) {
 					//handling userspace sequence number
 
 					//for(int hi = 0; hi < 1; hi++) {
-						uint64_t success = pp_post_send(ctx, (ctx->scnt%signalInterval == 0));
-						assert(success == 0);
+						//if(offset == 0) {
+							uint64_t success = pp_post_send(ctx, (ctx->scnt%signalInterval == 0));
+							assert(success == 0);
+						//}
 						/*
 						if (success == EINVAL) printf("Invalid value provided in wr \n");
 						else if (success == ENOMEM)	printf("Send Queue is full or not enough resources to complete this operation \n");
@@ -1343,11 +1378,11 @@ void* threadfunc(void* x) {
 
 			#if !SHARED_CQ && !FPGA_NOTIFICATION		
 			if(servername == NULL) {
-				//if(offset == numConnections-1) offset = 0;
-				//else offset++;
-
-				if(offset == ((numConnections/numThreads) * (thread_id+1)) -1) offset = (numConnections/numThreads) * thread_id;
+				if(offset == numConnections-1) offset = 0;
 				else offset++;
+
+				//if(offset == ((numConnections/numThreads) * (thread_id+1)) -1) offset = (numConnections/numThreads) * thread_id;
+				//else offset++;
 				
 			}
 			#endif
@@ -1355,7 +1390,7 @@ void* threadfunc(void* x) {
 			#if FPGA_NOTIFICATION
 			//printf("hi \n");
 			}
-			//ii+=8;
+			ii+=8;
 			//if(ii >= numConnections) ii = 0;
 			
 			#endif
@@ -1376,8 +1411,9 @@ void* threadfunc(void* x) {
 	printf("T %d, %d iters in %.5f seconds, rps = %f  \n", thread_id, rcnt, usec/1000000., rps[thread_id]);
 	#endif
 	
-	printf("connection 8 active = %llu \n", connection8Active);
-	printf("connection 9 active = %llu \n", connection9Active);
+	printf("T%llu found an empty queue %llu times \n", thread_id, foundEmptyQueue);
+	//printf("connection 8 active = %llu \n", connection8Active);
+	//printf("connection 9 active = %llu \n", connection9Active);
 
 	/*
 	//printf("\n\nprinting sequence number stats \n.\n.\n.\n");
@@ -1399,9 +1435,9 @@ void* threadfunc(void* x) {
 	//end of thread operations
 
 	#if FPGA_NOTIFICATION
-	printf("counting = %llu \n", counting);
-	printf("lzcntsaysworkbutactuallynotthere = %llu \n", lzcntsaysworkbutactuallynotthere);
-	printf("no_work_found_idle_polls = %llu \n", no_work_found_idle_polls);
+	//printf("counting = %llu \n", counting);
+	//printf("lzcntsaysworkbutactuallynotthere = %llu \n", lzcntsaysworkbutactuallynotthere);
+	//printf("no_work_found_idle_polls = %llu \n", no_work_found_idle_polls);
 	//printf("alliterations = %llu \n", alliterations);
 	#endif
 
@@ -1532,7 +1568,7 @@ int main(int argc, char *argv[])
 
 	for(uint64_t y = 0; y < numConnections; y++) {
 		//memset(ctx[y], 0, sizeof(struct pingpong_context*));
-		printf("y = %llu \n", y);
+		//printf("y = %llu \n", y);
 		ctx[y]  = pp_init_ctx(ib_dev, size, rx_depth, ib_port);
 		if (!ctx[y])
 			return 1;
@@ -1584,9 +1620,10 @@ int main(int argc, char *argv[])
 		inet_ntop(AF_INET6, &ctx[y]->my_dest.gid, gid, sizeof gid);
 		ctx[y]->my_dest.addr = (uintptr_t)ctx[y]->buf_write;
 		ctx[y]->my_dest.rkey = ctx[y]->mr_write->rkey;
-
-		printf("  local address:  LID 0x%04x, QPN 0x%06x, PSN 0x%06x, GID %s, ADDR %p, RKEY 0x%08x \n",
-			ctx[y]->my_dest.lid, ctx[y]->my_dest.qpn, ctx[y]->my_dest.psn, gid, ctx[y]->my_dest.addr, ctx[y]->my_dest.rkey);
+		
+		if(y  == 0) printf("ready to connect! \n");
+		//printf("  local address:  LID 0x%04x, QPN 0x%06x, PSN 0x%06x, GID %s, ADDR %p, RKEY 0x%08x \n",
+		//	ctx[y]->my_dest.lid, ctx[y]->my_dest.qpn, ctx[y]->my_dest.psn, gid, ctx[y]->my_dest.addr, ctx[y]->my_dest.rkey);
 
 
 		if (servername)
@@ -1598,8 +1635,8 @@ int main(int argc, char *argv[])
 			return 1;
 
 		inet_ntop(AF_INET6, &ctx[y]->rem_dest->gid, gid, sizeof gid);
-		printf("  remote address: LID 0x%04x, QPN 0x%06x, PSN 0x%06x, GID %s, ADDR %p, RKEY 0x%08x\n",
-			ctx[y]->rem_dest->lid, ctx[y]->rem_dest->qpn, ctx[y]->rem_dest->psn, gid, ctx[y]->rem_dest->addr, ctx[y]->rem_dest->rkey);
+		//printf("  remote address: LID 0x%04x, QPN 0x%06x, PSN 0x%06x, GID %s, ADDR %p, RKEY 0x%08x\n",
+		//	ctx[y]->rem_dest->lid, ctx[y]->rem_dest->qpn, ctx[y]->rem_dest->psn, gid, ctx[y]->rem_dest->addr, ctx[y]->rem_dest->rkey);
 
 		if (servername)
 			if (pp_connect_ctx(ctx[y], ib_port, ctx[y]->my_dest.psn, mtu, sl, ctx[y]->rem_dest,

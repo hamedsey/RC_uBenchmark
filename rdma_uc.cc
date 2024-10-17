@@ -441,6 +441,7 @@ static int resources_create(struct resources *res, uint32_t numberOfQueues, uint
     uint64_t totalBytes;
     //totalBytes = numberOfQueues;//(numAllocatedBits/8)*numberOfThreads;
     totalBytes = 4096 * (numberOfThreads+1); //numberOfQueues;//(numAllocatedBits/8)*numberOfThreads;
+    printf("number of threads = %llu \n", numberOfThreads);
 
     printf("number of bytes allocated = %llu \n", totalBytes);
     
@@ -453,7 +454,7 @@ static int resources_create(struct resources *res, uint32_t numberOfQueues, uint
     //assert(res->buf != NULL);
 
     //assert(posix_memalign((void **)(&res->buf), offset, totalBytes) == 0);
-    //        printf("buf address %p \n",(res->buf));
+    printf("buf address %p \n",(res->buf));
 
     //for(uint64_t s = 0; s < totalBytes; s++) printf("buf address %p \n",(res->buf)+s);
 

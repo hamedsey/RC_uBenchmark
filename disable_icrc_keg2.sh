@@ -16,5 +16,3 @@ sudo mcra /dev/mst/mt4117_pciconf0 0x53668.3:1 0
 sudo iptables -F; sudo iptables -t mangle -F
 sudo iptables -D INPUT -m conntrack --ctstate INVALID -j DROP
 sudo ethtool --set-priv-flags enp24s0 sniffer off
-/root/disable-mellanox-shell-credits.sh
-/home/hseyedro3/disable-mellanox-shell-credits.sh

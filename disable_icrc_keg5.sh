@@ -21,4 +21,4 @@ sudo iptables -F; sudo iptables -t mangle -F
 sudo iptables -D INPUT -m conntrack --ctstate INVALID -j DROP
 sudo ethtool --set-priv-flags enp24s0 sniffer off
 /root/disable-mellanox-shell-credits.sh
-/home/hseyedro3/disable-mellanox-shell-credits.sh
+/nethome/hseyedro3/keg5/hseyedro3/disable-mellanox-shell-credits.sh
