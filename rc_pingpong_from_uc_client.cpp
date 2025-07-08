@@ -65,6 +65,7 @@
 #include <sched.h>
 #include <array>
 #include <set>
+
 //#include "pingpong.h"
 #include <infiniband/verbs.h>
 #include <linux/types.h>  //for __be32 type
@@ -73,6 +74,9 @@
 
 #include <algorithm>
 #include <random>
+#include <iostream>
+#include <chrono>
+
 #define SERVICE_TIME_SIZE 0x8000
 
 #define MAX_QUEUES 1024
@@ -80,7 +84,12 @@
 #define RC 1
 
 #define MEASURE_LATENCIES_ON_CLIENT 1
-#define RUNTIME 10
+#define RUNTIME 1
+const uint8_t numEpochs = 30;
+
+#define NOTIFICATION_QUEUE 0
+
+#define ENABLE_KERNEL 0
 
 enum {
 	FIXED = 0,
@@ -105,15 +114,22 @@ enum {
 	FIFTYP = 16,
 	CONFIFTYP = 17,
 	MIXED = 18,
-	TWENTYPRAND = 19,
-	TENPRAND = 20
+	FIFTYPRAND = 19,
+	TWENTYPRAND = 20,
+	TENPRAND = 21,
+	HUNDREDPRAND = 22,
+	MIXEDRAND = 23
 };
+
+pthread_barrier_t barrier; 
+pthread_barrierattr_t attr;
+int ret; 
 
 struct ibv_device      **dev_list;
 struct ibv_device	*ib_dev;
 char                    *ib_devname = NULL;
 char                    *servername = NULL;
-unsigned int             port = 18515;
+unsigned int             port = 18511;
 int                      ib_port = 1;
 unsigned int             size = 4096;
 enum ibv_mtu		 	 mtu = IBV_MTU_1024;
@@ -148,14 +164,13 @@ uint8_t *expectedSeqNum;
 
 #if MEASURE_LATENCIES_ON_CLIENT
 uint64_t ***latencies;
-uint64_t **sendDistribution;
+uint64_t ***latenciesTimestamp;
+
 uint64_t **recvDistribution;
+uint8_t ***whichcore;
 
-struct timespec starttime;
-struct timespec **nowtime;
-uint16_t **whichconn;
-uint16_t **whichcore;
-
+uint16_t ***whichQueueDepth;
+uint16_t ***whichMaxMinQueueDepthDiff;
 #endif
 
 #if SHARED_CQ
@@ -164,11 +179,22 @@ struct ibv_cq **sharedCQ;
 
 char* output_dir;
 
-uint8_t numEpochs = 1;
-std::set<uint16_t> uniqueNumbers20P;
-std::set<uint16_t> uniqueNumbers10P;
+std::set<uint16_t> uniqueNumbers50P[numEpochs];
+std::set<uint16_t> uniqueNumbers20P[numEpochs];
+std::set<uint16_t> uniqueNumbers10P[numEpochs];
+std::set<uint16_t> uniqueNumbers100P[numEpochs];
 
+//uint64_t numExpectedRequestsPerThread;
+uint64_t numExpectedRequestsPerConnection;
 
+uint64_t *rcnt;
+uint64_t *scnt; 
+uint64_t *souts;
+uint64_t *largestCoreDepthDifference;
+
+#if ENABLE_KERNEL
+uint64_t **connArray;
+#endif
 
 uint64_t gen_latency(int mean, int mode, int isMeasThread, uint64_t *serviceTime) {
     
@@ -334,11 +360,12 @@ struct thread_data {
 	#if MEASURE_LATENCIES_ON_CLIENT
 	uint64_t** latencyArr;
 	uint64_t* receives;
-
-	struct timespec *nowtime;
-	uint16_t *whichconn;
-	uint16_t *whichcore;
-
+	uint64_t** latencyArrTimestamp;
+	
+	uint8_t **whichcore;
+	uint64_t rcnt, scnt, souts;
+	uint16_t **whichQueueDepth;
+	uint16_t **whichMaxMinQueueDepthDiff;
 	#endif
 };
 
@@ -976,23 +1003,23 @@ static void usage(const char *argv0)
 
 void* threadfunc(void* x) {
 	//printf("hello \n");
-	struct timeval           start, end;
 	struct thread_data *tdata = (struct thread_data *)x;
 	struct pingpong_context **ctxs = (struct pingpong_context **)(tdata->ctxs);
 	uint64_t thread_id = tdata->thread_id;
-
 	#if MEASURE_LATENCIES_ON_CLIENT
 	uint64_t ** latencyArr = tdata->latencyArr;
 	uint64_t *receives = tdata->receives;
-
-	struct timespec *nowtime = tdata->nowtime;
-	uint16_t *whichconn = tdata->whichconn;
-	uint16_t *whichcore = tdata->whichcore;
+	uint64_t ** latencyArrTimestamp = tdata->latencyArrTimestamp;
+	uint8_t **whichcore = tdata->whichcore;
+	uint16_t **whichQueueDepth = tdata->whichQueueDepth;
+	uint16_t **whichMaxMinQueueDepthDiff = tdata->whichMaxMinQueueDepthDiff;
 
 	#endif
 
 	uint64_t offset = thread_id % numConnections;
-	unsigned int rcnt = 0, scnt = 0, souts = 0;
+	uint64_t rcnt = tdata->rcnt; 
+	uint64_t scnt = tdata->scnt;
+	uint64_t souts = tdata->souts;
 	//printf("thread id = %llu \n", thread_id);
 
 	//printf("ctx->id = %llu \n", ctxs[thread_id]->id);
@@ -1011,6 +1038,16 @@ void* threadfunc(void* x) {
 	std::random_device rd{};
 	std::mt19937 gen{rd()};
 	std::exponential_distribution<double> exp{1/((double)avg_inter_arr_ns)};//-SEND_SERVICE_TIME)};
+
+
+
+	uint64_t singleThreadWaitWarmUp = 1000000000/10000; //1 kRPS for warmup
+	uint64_t avg_inter_arr_ns_warmup = numThreads*singleThreadWaitWarmUp;
+	if(thread_id == 0) printf("avg_inter_arr_ns for warmup = %llu \n",avg_inter_arr_ns_warmup);
+
+	std::random_device rdwarmup{};
+	std::mt19937 genwarmup{rdwarmup()};
+	std::exponential_distribution<double> expwarmup{1/((double)avg_inter_arr_ns_warmup)};//-SEND_SERVICE_TIME)};
 	//for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 	//	arrivalSleepTime[i] = exp(gen);
 		//printf("arrivalSleepTime = %llu \n", arrivalSleepTime[i]);
@@ -1019,12 +1056,22 @@ void* threadfunc(void* x) {
 
 
 	uint64_t *serviceTime = (uint64_t *)malloc(SERVICE_TIME_SIZE*sizeof(uint64_t));
-	uint16_t *priorityID = (uint16_t *)malloc(SERVICE_TIME_SIZE*sizeof(uint64_t));
 
-	uint16_t *priority50p = (uint16_t *)malloc(SERVICE_TIME_SIZE*sizeof(uint64_t));
-	uint16_t *priority20p = (uint16_t *)malloc(SERVICE_TIME_SIZE*sizeof(uint64_t));
-	uint16_t *priority10p = (uint16_t *)malloc(SERVICE_TIME_SIZE*sizeof(uint64_t));
+	uint16_t **priorityID = (uint16_t **)malloc(numEpochs*sizeof(uint16_t*));
+	for(uint16_t ep = 0; ep < numEpochs; ep++) priorityID[ep] = (uint16_t *)malloc(SERVICE_TIME_SIZE*sizeof(uint16_t));
 
+	uint16_t *priority50p = (uint16_t *)malloc(SERVICE_TIME_SIZE*sizeof(uint16_t));
+	uint16_t *priority20p = (uint16_t *)malloc(SERVICE_TIME_SIZE*sizeof(uint16_t));
+	uint16_t *priority10p = (uint16_t *)malloc(SERVICE_TIME_SIZE*sizeof(uint16_t));
+
+	uint16_t *warmUpPriority = (uint16_t *)malloc(SERVICE_TIME_SIZE*sizeof(uint16_t));
+	std::random_device rdd{};
+	std::mt19937 genn{rdd()};
+	std::uniform_int_distribution<uint64_t>* bmm = new std::uniform_int_distribution<uint64_t>(thread_id*connPerThread, ((thread_id+1)*connPerThread)-1);
+	for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
+		//printf("result = %d \n",result);
+		warmUpPriority[i] =(*bmm)(genn);
+	}
 
 
 	if(distribution_mode == FIXED) {
@@ -1039,6 +1086,7 @@ void* threadfunc(void* x) {
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) serviceTime[i] = exp(gen);
 	}
 	else if(distribution_mode == BIMODAL) {
+		//printf("generating service time with bimodal distribution \n");
 		std::random_device rd{};
 		std::mt19937 gen{rd()};
 		std::discrete_distribution<> bm({double(100-long_query_percent), double(long_query_percent)});
@@ -1048,6 +1096,7 @@ void* threadfunc(void* x) {
 			if (result == 0) serviceTime[i] = mean;
 			else serviceTime[i] = mean*bimodal_ratio;
 		}
+		//for (int i = 0; i < SERVICE_TIME_SIZE; ++i) printf("%llu ",serviceTime[i]);
 	}
 	else printf("Invalid service time distribution mode \n");
 	std::uniform_int_distribution<uint64_t>* bm = nullptr;
@@ -1059,7 +1108,7 @@ void* threadfunc(void* x) {
 
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
-			priorityID[i] =(*bm)(gen);
+			priorityID[numEpochs-1][i] =(*bm)(gen);
 		}
 
 		/*
@@ -1085,12 +1134,12 @@ void* threadfunc(void* x) {
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
 			if(bm(gen) == 0) {
-				priorityID[i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
+				priorityID[numEpochs-1][i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
 				//if(twentyPercent == numQueuesGettingMoreLoad-1) twentyPercent = 0;
 				//else twentyPercent++;
 			}
 			else {
-				priorityID[i] = (*ur80)(gen);//eightyPercent;//8*eightyPercent;
+				priorityID[numEpochs-1][i] = (*ur80)(gen);//eightyPercent;//8*eightyPercent;
 				//if(eightyPercent == numConnections-1/*7*/) eightyPercent = numQueuesGettingMoreLoad;
 				//else eightyPercent++;
 			}
@@ -1100,7 +1149,7 @@ void* threadfunc(void* x) {
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
 			//priorityID[i] = numConnections-1;
-			priorityID[i] = thread_id*connPerThread;
+			priorityID[numEpochs-1][i] = thread_id*connPerThread;
 		}
 	}
 	else if(priority_distribution_mode == NC) {
@@ -1118,12 +1167,12 @@ void* threadfunc(void* x) {
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
 			if(bm(gen) == 0) {
-				priorityID[i] = twentyPercent;
+				priorityID[numEpochs-1][i] = twentyPercent;
 				if(twentyPercent == numQueuesGettingMoreLoad-1) twentyPercent = 0;
 				else twentyPercent++;
 			}
 			else {
-				priorityID[i] = eightyPercent;
+				priorityID[numEpochs-1][i] = eightyPercent;
 				if(eightyPercent == numConnections-1) eightyPercent = numQueuesGettingMoreLoad;
 				else eightyPercent++;
 			}
@@ -1134,14 +1183,14 @@ void* threadfunc(void* x) {
 		//generating 10000 item array of discrete exponentially distributed priorities
 		const uint64_t arrayLength = 10000;
         std::array<uint64_t, arrayLength> arr;
-		std::random_device rd{};
-		std::mt19937 gen{rd()};
+		std::random_device rdo{};
+		std::mt19937 geno{rdo()};
 		double meanPriorities = numConnections/2;//4;
 		//double lambda = 100; // Exponential distribution parameter
-		std::exponential_distribution<double> exp{1/(double)meanPriorities};
+		std::exponential_distribution<double> expo{1/(double)meanPriorities};
 		for (int i = 0; i < arr.size(); ++i) {
 			// Generate a random number from the exponential distribution
-			double randomNumber = exp(gen);
+			double randomNumber = expo(geno);
 
 			// Scale the random number to the range [0, 255]
 			uint64_t scaledNumber = static_cast<uint64_t>(randomNumber) % numConnections;
@@ -1172,7 +1221,7 @@ void* threadfunc(void* x) {
 
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
-			priorityID[i] = arr[bm(gen)];
+			priorityID[numEpochs-1][i] = arr[bm(gen)];
 		}
 		/*
 		for (int i = 0; i < SERVICE_TIME_SIZE; ++i) {
@@ -1197,21 +1246,25 @@ void* threadfunc(void* x) {
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
 			if(bm(gen) == 0) {
-				priorityID[i] = numConnections-1-(*ur20)(gen);//twentyPercent;//8*twentyPercent;
+				priorityID[numEpochs-1][i] = numConnections-1-(*ur20)(gen);//twentyPercent;//8*twentyPercent;
 				//if(twentyPercent == numQueuesGettingMoreLoad-1) twentyPercent = 0;
 				//else twentyPercent++;
 			}
 			else {
-				priorityID[i] = numConnections-1-(*ur80)(gen);//eightyPercent;//8*eightyPercent;
+				priorityID[numEpochs-1][i] = numConnections-1-(*ur80)(gen);//eightyPercent;//8*eightyPercent;
 				//if(eightyPercent == numConnections-1/*7*/) eightyPercent = numQueuesGettingMoreLoad;
 				//else eightyPercent++;
 			}
 		}
 	}
 	else if(priority_distribution_mode == RR) {
+		connPerThread = numConnections/numThreads;
+		uint64_t tempConn = thread_id*connPerThread;
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
-			priorityID[i] = i%numConnections;
+			priorityID[numEpochs-1][i] = tempConn;
+			if(tempConn == ((thread_id+1)*connPerThread) - 1) tempConn = thread_id*connPerThread;
+			else tempConn++;
 			//priorityID[i] = thread_id*connPerThread;
 		}
 	}
@@ -1228,7 +1281,7 @@ void* threadfunc(void* x) {
 
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
-			priorityID[i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
+			priorityID[numEpochs-1][i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
 		}
 	}
 	else if(priority_distribution_mode == TENP) { //each thread sends to 10% of its fraction of queues
@@ -1244,7 +1297,7 @@ void* threadfunc(void* x) {
 
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
-			priorityID[i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
+			priorityID[numEpochs-1][i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
 		}
 	}
 	else if(priority_distribution_mode == CONTWENTYP) {
@@ -1261,7 +1314,7 @@ void* threadfunc(void* x) {
 
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
-			priorityID[i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
+			priorityID[numEpochs-1][i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
 		}
 	}
 	else if(priority_distribution_mode == CONTENP) {
@@ -1278,7 +1331,7 @@ void* threadfunc(void* x) {
 
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
-			priorityID[i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
+			priorityID[numEpochs-1][i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
 		}
 	}
 	else if(priority_distribution_mode == FIFTYP) { //each thread sends to 50% of its fraction of queues
@@ -1294,7 +1347,7 @@ void* threadfunc(void* x) {
 
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
-			priorityID[i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
+			priorityID[numEpochs-1][i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
 		}
 	}
 	else if(priority_distribution_mode == CONFIFTYP) { //each thread sends to an even fraction of the first 50% of queues
@@ -1311,14 +1364,14 @@ void* threadfunc(void* x) {
 
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
 			//printf("result = %d \n",result);
-			priorityID[i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
+			priorityID[numEpochs-1][i] = (*ur20)(gen);//twentyPercent;//8*twentyPercent;
 		}
 	}
 	else if(priority_distribution_mode == MIXED) {
 		std::random_device rd{};
 		std::mt19937 gen{rd()};
     	bm = new std::uniform_int_distribution<uint64_t>(thread_id*connPerThread, ((thread_id+1)*connPerThread)-1);
-		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) priorityID[i] =(*bm)(gen);
+		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) priorityID[0][i] =(*bm)(gen);
 
 
 		uint16_t numQueuesGettingMoreLoad = numConnections/2; //8/5;
@@ -1341,32 +1394,134 @@ void* threadfunc(void* x) {
 		eightyPercent = twentyPercent+connPerThread;
 		std::uniform_int_distribution<uint64_t>* ur10 = new std::uniform_int_distribution<uint64_t>(thread_id*connPerThread, eightyPercent-1);
 		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) priority10p[i] = (*ur10)(gen);
+
 	}
-	else if(priority_distribution_mode == TWENTYPRAND) { //each thread sends to 20% of its fraction of queues
+	else if(priority_distribution_mode == FIFTYPRAND) { //each thread sends to 50% of its fraction of queues
+		for(uint16_t e = 0; e < numEpochs; e++) {
+			uint16_t numConsEachThreadResponsibleFor = (uniqueNumbers50P[e].size())/numThreads;
+			//printf("numConsEachThreadResponsibleFor = %llu \n", numConsEachThreadResponsibleFor);
+			std::uniform_int_distribution<uint64_t>* ur50 = new std::uniform_int_distribution<uint64_t>(thread_id*numConsEachThreadResponsibleFor, ((thread_id+1)*numConsEachThreadResponsibleFor)-1);
 
-		//uint16_t twentyPercent = thread_id*connPerThread; //0
-		//uint16_t eightyPercent = twentyPercent+numQueuesGettingMoreLoad;
-
-		uint16_t numConsEachThreadResponsibleFor = (uniqueNumbers20P.size())/numThreads;
-		printf("numConsEachThreadResponsibleFor = %llu \n", numConsEachThreadResponsibleFor);
-		std::uniform_int_distribution<uint64_t>* ur20 = new std::uniform_int_distribution<uint64_t>(thread_id*numConsEachThreadResponsibleFor, ((thread_id+1)*numConsEachThreadResponsibleFor)-1);
-
-		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
-			std::set<uint16_t>::iterator it = uniqueNumbers20P.begin();
-			std::advance(it, (*ur20)(gen));
-			priorityID[i] = *it;//twentyPercent;//8*twentyPercent;
+			for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
+				std::set<uint16_t>::iterator it = uniqueNumbers50P[e].begin();
+				std::advance(it, (*ur50)(gen));
+				priorityID[e][i] = *it;//twentyPercent;//8*twentyPercent;
+			}
 		}
 	}
-	else if(priority_distribution_mode == TENPRAND) { //each thread sends to 20% of its fraction of queues
+	else if(priority_distribution_mode == TWENTYPRAND) { //each thread sends to 20% of its fraction of queues
+		for(uint16_t e = 0; e < numEpochs; e++) {
+			uint16_t numConsEachThreadResponsibleFor = (uniqueNumbers20P[e].size())/numThreads;
+			//printf("numConsEachThreadResponsibleFor = %llu \n", numConsEachThreadResponsibleFor);
+			std::uniform_int_distribution<uint64_t>* ur20 = new std::uniform_int_distribution<uint64_t>(thread_id*numConsEachThreadResponsibleFor, ((thread_id+1)*numConsEachThreadResponsibleFor)-1);
 
-		uint16_t numConsEachThreadResponsibleFor = (uniqueNumbers10P.size())/numThreads;
-		printf("numConsEachThreadResponsibleFor = %llu \n", numConsEachThreadResponsibleFor);
-		std::uniform_int_distribution<uint64_t>* ur10 = new std::uniform_int_distribution<uint64_t>(thread_id*numConsEachThreadResponsibleFor, ((thread_id+1)*numConsEachThreadResponsibleFor)-1);
+			for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
+				std::set<uint16_t>::iterator it = uniqueNumbers20P[e].begin();
+				std::advance(it, (*ur20)(gen));
+				priorityID[e][i] = *it;//twentyPercent;//8*twentyPercent;
+			}
+		}
+	}
+	else if(priority_distribution_mode == TENPRAND) { //each thread sends to 10% of its fraction of queues
+		for(uint16_t e = 0; e < numEpochs; e++) {
+			uint16_t numConsEachThreadResponsibleFor = (uniqueNumbers10P[e].size())/numThreads;
+			//printf("numConsEachThreadResponsibleFor = %llu \n", numConsEachThreadResponsibleFor);
+			//std::uniform_int_distribution<uint64_t>* ur10 = new std::uniform_int_distribution<uint64_t>(0, uniqueNumbers10P[e].size()-1);
+			std::uniform_int_distribution<uint64_t>* ur10 = new std::uniform_int_distribution<uint64_t>(thread_id*numConsEachThreadResponsibleFor, ((thread_id+1)*numConsEachThreadResponsibleFor)-1);
 
-		for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
-			std::set<uint16_t>::iterator it = uniqueNumbers10P.begin();
-			std::advance(it, (*ur10)(gen));
-			priorityID[i] = *it;//twentyPercent;//8*twentyPercent;
+			for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
+				std::set<uint16_t>::iterator it = uniqueNumbers10P[e].begin();
+				std::advance(it, (*ur10)(gen));
+				priorityID[e][i] = *it;//twentyPercent;//8*twentyPercent;
+			}
+		}
+	}
+	else if(priority_distribution_mode == HUNDREDPRAND) { //each thread sends to 10% of its fraction of queues
+		for(uint16_t e = 0; e < numEpochs; e++) {
+
+			std::random_device rd{};
+			std::mt19937 gen{rd()};
+			bm = new std::uniform_int_distribution<uint64_t>(thread_id*connPerThread, ((thread_id+1)*connPerThread)-1);
+			//std::uniform_int_distribution<uint64_t> bm(0, numConnections-1);
+
+			for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
+				//printf("result = %d \n",result);
+				priorityID[e][i] =(*bm)(gen);
+			}
+			/*
+			uint16_t numConsEachThreadResponsibleFor = (uniqueNumbers100P[e].size())/numThreads;
+			//printf("numConsEachThreadResponsibleFor = %llu \n", numConsEachThreadResponsibleFor);
+			//std::uniform_int_distribution<uint64_t>* ur100 = new std::uniform_int_distribution<uint64_t>(0, uniqueNumbers100P[e].size()-1);
+			std::uniform_int_distribution<uint64_t>* ur100 = new std::uniform_int_distribution<uint64_t>(thread_id*numConsEachThreadResponsibleFor, ((thread_id+1)*numConsEachThreadResponsibleFor)-1);
+
+			for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
+				std::set<uint16_t>::iterator it = uniqueNumbers100P[e].begin();
+				std::advance(it, (*ur100)(gen));
+				priorityID[e][i] = *it;//twentyPercent;//8*twentyPercent;
+			}
+			*/
+		}
+	}
+	else if(priority_distribution_mode == MIXEDRAND) { //each thread sends to 10% of its fraction of queues
+		for(uint16_t e = 0; e < numEpochs; e++) {
+
+			if( (e >= 0 && e < numEpochs/4) ) {
+				
+				uint16_t numConsEachThreadResponsibleFor = (uniqueNumbers100P[e].size())/numThreads;
+				//printf("numConsEachThreadResponsibleFor = %llu \n", numConsEachThreadResponsibleFor);
+				std::uniform_int_distribution<uint64_t>* ur100 = new std::uniform_int_distribution<uint64_t>(thread_id*numConsEachThreadResponsibleFor, ((thread_id+1)*numConsEachThreadResponsibleFor)-1);
+
+				for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
+					std::set<uint16_t>::iterator it = uniqueNumbers100P[e].begin();
+					std::advance(it, (*ur100)(gen));
+					priorityID[e][i] = *it;//twentyPercent;//8*twentyPercent;
+				}
+				
+				/*
+				std::random_device rd{};
+				std::mt19937 gen{rd()};
+				bm = new std::uniform_int_distribution<uint64_t>(thread_id*connPerThread, ((thread_id+1)*connPerThread)-1);
+				//std::uniform_int_distribution<uint64_t> bm(0, numConnections-1);
+
+				for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
+					//printf("result = %d \n",result);
+					priorityID[e][i] =(*bm)(gen);
+				}
+				*/
+			}
+			else if( (e >= numEpochs/4 && e < numEpochs/2) ) {
+				uint16_t numConsEachThreadResponsibleFor = (uniqueNumbers50P[e].size())/numThreads;
+				//printf("numConsEachThreadResponsibleFor = %llu \n", numConsEachThreadResponsibleFor);
+				std::uniform_int_distribution<uint64_t>* ur50 = new std::uniform_int_distribution<uint64_t>(thread_id*numConsEachThreadResponsibleFor, ((thread_id+1)*numConsEachThreadResponsibleFor)-1);
+
+				for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
+					std::set<uint16_t>::iterator it = uniqueNumbers50P[e].begin();
+					std::advance(it, (*ur50)(gen));
+					priorityID[e][i] = *it;//twentyPercent;//8*twentyPercent;
+				}
+			}
+			else if( (e >= numEpochs/2 && e < 3*numEpochs/4) ) {
+				uint16_t numConsEachThreadResponsibleFor = (uniqueNumbers20P[e].size())/numThreads;
+				//printf("numConsEachThreadResponsibleFor = %llu \n", numConsEachThreadResponsibleFor);
+				std::uniform_int_distribution<uint64_t>* ur20 = new std::uniform_int_distribution<uint64_t>(thread_id*numConsEachThreadResponsibleFor, ((thread_id+1)*numConsEachThreadResponsibleFor)-1);
+
+				for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
+					std::set<uint16_t>::iterator it = uniqueNumbers20P[e].begin();
+					std::advance(it, (*ur20)(gen));
+					priorityID[e][i] = *it;//twentyPercent;//8*twentyPercent;
+				}
+			}
+			else {
+				uint16_t numConsEachThreadResponsibleFor = (uniqueNumbers10P[e].size())/numThreads;
+				//printf("numConsEachThreadResponsibleFor = %llu \n", numConsEachThreadResponsibleFor);
+				std::uniform_int_distribution<uint64_t>* ur10 = new std::uniform_int_distribution<uint64_t>(thread_id*numConsEachThreadResponsibleFor, ((thread_id+1)*numConsEachThreadResponsibleFor)-1);
+
+				for(uint64_t i = 0; i < SERVICE_TIME_SIZE; i++) {
+					std::set<uint16_t>::iterator it = uniqueNumbers10P[e].begin();
+					std::advance(it, (*ur10)(gen));
+					priorityID[e][i] = *it;//twentyPercent;//8*twentyPercent;
+				}
+			}
 		}
 	}
 
@@ -1392,8 +1547,7 @@ void* threadfunc(void* x) {
 	//uint8_t *firstOne = (uint8_t*)malloc(numConnections*sizeof(uint8_t));
 	//for(uint64_t g = 0; g < numConnections; g++) firstOne[g] = 1;
 
-	struct timespec ttime,curtime;
-	clock_gettime(CLOCK_MONOTONIC,&ttime);
+
 	uint64_t index = 0;
 
 	/*
@@ -1410,14 +1564,21 @@ void* threadfunc(void* x) {
 	uint8_t epochNumber = 0;
 	uint16_t priority = 0;
 
-	clock_gettime(CLOCK_MONOTONIC,&starttime);
+	uint16_t largestCoreQD = 0;
+	uint16_t tempCoreQD = 0;
 
-	while(epochNumber != numEpochs) {
 
-		if (gettimeofday(&start, NULL)) {
-			perror("gettimeofday");
-			return 0;
-		}
+	ret = pthread_barrier_wait(&barrier);
+
+	struct timespec ttime,curtime;
+	clock_gettime(CLOCK_MONOTONIC,&ttime);
+
+	struct timespec realStart, epochStart;
+	
+	while(epochNumber-1 != numEpochs) {
+
+		clock_gettime(CLOCK_MONOTONIC,&epochStart);
+
 		while (1) {
 				//compare to previous version that was save
 				//try adding shared CQ
@@ -1433,14 +1594,19 @@ void* threadfunc(void* x) {
 			//else index++;
 
 			if(priority_distribution_mode == MIXED) {
-				if(epochNumber == 0 || epochNumber == 1) priority = /*(*bm)(gen);*/ gen_priority(priorityID);
-				else if(epochNumber == 2) priority = /*(*bm)(gen);*/ gen_priority(priority50p);
-				else if(epochNumber == 3) priority = /*(*bm)(gen);*/ gen_priority(priority20p);
-				else if(epochNumber == 4) priority = /*(*bm)(gen);*/ gen_priority(priority10p);
+				if(epochNumber == 0) priority = /*(*bm)(gen);*/ gen_priority(warmUpPriority);
+				else if(epochNumber == 1 || epochNumber == 2) priority = /*(*bm)(gen);*/ gen_priority(priorityID[0]);
+				else if(epochNumber == 3) priority = /*(*bm)(gen);*/ gen_priority(priority50p);
+				else if(epochNumber == 4) priority = /*(*bm)(gen);*/ gen_priority(priority20p);
+				else if(epochNumber == 5) priority = /*(*bm)(gen);*/ gen_priority(priority10p);
 				else assert(false);
 			}
-			else priority = /*(*bm)(gen);*/ gen_priority(priorityID);
-
+			else if(priority_distribution_mode == FIFTYPRAND || priority_distribution_mode == TWENTYPRAND || priority_distribution_mode == TENPRAND || priority_distribution_mode == HUNDREDPRAND || priority_distribution_mode == MIXEDRAND) {
+				if(epochNumber == 0) priority = /*(*bm)(gen);*/ gen_priority(warmUpPriority);
+				else priority = /*(*bm)(gen);*/ gen_priority(priorityID[epochNumber-1]);
+			}
+			else priority = /*(*bm)(gen);*/ gen_priority(priorityID[numEpochs-1]);
+			//assert(priority == 0);
 			//printf("T %llu , priority = %llu \n",thread_id, priority);
 			//if(priority != prio_prev) 
 			ctx = ctxs[priority];
@@ -1450,7 +1616,7 @@ void* threadfunc(void* x) {
 
 			if (servername && (ctx->souts - ctx->rcnt < ctx->rx_depth)) { //&& (souts - rcnt < window_per_thread)) {
 
-				uint64_t req_lat = mean;//gen_latency(mean, distribution_mode, 0, serviceTime);
+				uint64_t req_lat = gen_latency(mean, distribution_mode, 0, serviceTime);
 				req_lat = req_lat >> 4;
 				//printf("lat = %d \n",req_lat); 
 
@@ -1468,8 +1634,79 @@ void* threadfunc(void* x) {
 				//	firstOne[priority] = 0;
 				//}
 				//else 
-				ctx->buf_send[0] = 0; //0, 64
+				if(epochNumber == 0) ctx->buf_send[0] = 0; //0, 64
+				else ctx->buf_send[0] = 16; //0, 64
 
+				#if NOTIFICATION_QUEUE
+				assert(priority == 0);
+				if(priority == 0) {
+					ctx->buf_send[11] = (uint8_t)(req_lat & ((1u <<  8) - 1));
+					ctx->buf_send[10] = (uint8_t)((req_lat >> 8) & ((1u <<  8) - 1));
+				}
+				else {
+					ctx->buf_send[11] = 0;
+					ctx->buf_send[10] = 0;
+				}
+					//ctx->buf_send[12] = ctx->nextSequenceNumToSend;
+					//ctx->buf_send[19] = priority;
+					if(ctx->nextSequenceNumToSend == 255) ctx->nextSequenceNumToSend = 0;
+					else ctx->nextSequenceNumToSend++;
+
+					//printf("buf_send \n");
+					ctx->souts++;
+					souts++;
+					uint64_t success = pp_post_send(ctx, (ctx->souts%signalInterval == 0));
+					if (success == EINVAL) printf("Invalid value provided in wr \n");
+					else if (success == ENOMEM)	printf("Send Queue is full or not enough resources to complete this operation \n");
+					else if (success == EFAULT) printf("Invalid value provided in qp \n");
+					else if (success != 0) {
+						printf("success = %d, \n",success);
+						fprintf(stderr, "Couldn't post send 3 \n");
+						//return 1;
+					}
+					else {
+						//printf("send posted ... \n");
+					}
+				//}
+				//else {
+					
+					struct pingpong_context *ctx1 = ctxs[1];
+					//if (ctx1->souts - ctx1->rcnt < ctx1->rx_depth) {
+						ctx1->buf_send[11] = 0;
+						ctx1->buf_send[10] = 0;
+
+						//ctx1->buf_send[12] = ctx1->nextSequenceNumToSend;
+						//ctx->buf_send[19] = priority;
+						if(ctx1->nextSequenceNumToSend == 255) ctx1->nextSequenceNumToSend = 0;
+						else ctx1->nextSequenceNumToSend++;
+
+						//printf("buf_send \n");
+						ctx1->souts++;
+						souts++;
+						success = pp_post_send(ctx1, (ctx1->souts%signalInterval == 0));
+						if (success == EINVAL) printf("Invalid value provided in wr \n");
+						else if (success == ENOMEM)	printf("2 Send Queue is full or not enough resources to complete this operation \n");
+						else if (success == EFAULT) printf("Invalid value provided in qp \n");
+						else if (success != 0) {
+							printf("success = %d, \n",success);
+							fprintf(stderr, "Couldn't post send 3 \n");
+							//return 1;
+						}
+						else {
+							//printf("notification posted ... \n");
+						}
+						countSendPriority[thread_id][1]++;
+					//}
+					
+					
+				//}	
+				//printf("sleep_int_lower = %llu \n",(uint8_t)ctx->buf_send[11]);
+				//printf("sleep_int_upper = %llu \n",(uint8_t)ctx->buf_send[10]);
+				//sequence number
+				
+				#else
+
+				
 				ctx->buf_send[11] = (uint8_t)(req_lat & ((1u <<  8) - 1));
 				ctx->buf_send[10] = (uint8_t)((req_lat >> 8) & ((1u <<  8) - 1));
 				
@@ -1477,7 +1714,7 @@ void* threadfunc(void* x) {
 				//printf("sleep_int_upper = %llu \n",(uint8_t)ctx->buf_send[10]);
 
 				//sequence number
-				ctx->buf_send[12] = ctx->nextSequenceNumToSend;
+				//ctx->buf_send[12] = ctx->nextSequenceNumToSend;
 				//ctx->buf_send[19] = priority;
 				if(ctx->nextSequenceNumToSend == 255) ctx->nextSequenceNumToSend = 0;
 				else ctx->nextSequenceNumToSend++;
@@ -1497,8 +1734,7 @@ void* threadfunc(void* x) {
 				else {
 					//printf("send posted ... \n");
 				}
-
-				
+				#endif
 				//success = pp_post_write(ctx, (ctx->souts%signalInterval == 0), 0);
 				/*
 				if(ctx->souts == 1) {
@@ -1522,6 +1758,7 @@ void* threadfunc(void* x) {
 				countSendPriority[thread_id][priority]++;
 				//double interArrivalWaitTime = ran_expo(1/1000);
 
+				/*
 				if(priority_distribution_mode == MIXED) {
 					if(epochNumber > 0) {
 						uint64_t arrival_wait_time = exp(gen);//gen_arrival_time(arrivalSleepTime);
@@ -1533,29 +1770,49 @@ void* threadfunc(void* x) {
 					}
 				}
 				else {
-					uint64_t arrival_wait_time = exp(gen);//gen_arrival_time(arrivalSleepTime);
-					//printf("%llu \n", arrival_wait_time);
-					clock_gettime(CLOCK_MONOTONIC,&curtime);
-					uint64_t elapsed = (curtime.tv_sec-ttime.tv_sec )/1e-9 + (curtime.tv_nsec-ttime.tv_nsec);
-					if(elapsed < arrival_wait_time) my_sleep(arrival_wait_time - elapsed);
-					//my_sleep(arrival_wait_time);
-				}
+				*/
+					if(epochNumber > 0) {
+						uint64_t arrival_wait_time = exp(gen);//gen_arrival_time(arrivalSleepTime);
+						//printf("%llu \n", arrival_wait_time);
+						clock_gettime(CLOCK_MONOTONIC,&curtime);
+						uint64_t elapsed = (curtime.tv_sec-ttime.tv_sec )/1e-9 + (curtime.tv_nsec-ttime.tv_nsec);
+						if(elapsed < arrival_wait_time) my_sleep(arrival_wait_time - elapsed);
+						//my_sleep(arrival_wait_time);
+					}
+					else {
+						uint64_t arrival_wait_time = expwarmup(genwarmup);//gen_arrival_time(arrivalSleepTime);
+						//printf("%llu \n", arrival_wait_time);
+						clock_gettime(CLOCK_MONOTONIC,&curtime);
+						uint64_t elapsed = (curtime.tv_sec-ttime.tv_sec )/1e-9 + (curtime.tv_nsec-ttime.tv_nsec);
+						if(elapsed < arrival_wait_time) my_sleep(arrival_wait_time - elapsed);
+						//my_sleep(arrival_wait_time);
+					}
+				//}
 			}
 
 			clock_gettime(CLOCK_MONOTONIC,&ttime);
 
-			//if(ctx->id == 1 && servername) break;
-			if (gettimeofday(&end, NULL)) {
-				perror("gettimeofday");
-				return 0;
-			}
-
 			//runtime
-			if(end.tv_sec - start.tv_sec > RUNTIME) {
-				printf("epoch %llu done \n", epochNumber);
-				epochNumber++;
-				break;
+			if(epochNumber == 0) {
+				if((ttime.tv_sec-epochStart.tv_sec)*1e9 + (ttime.tv_nsec-epochStart.tv_nsec) >= 1e9*3) {
+					printf("T%llu warmup done \n", thread_id);
+					epochNumber++;
+
+					sleep(5);
+					ret = pthread_barrier_wait(&barrier);
+					clock_gettime(CLOCK_MONOTONIC,&realStart); 
+
+					break;
+				}
 			}
+			else {
+				if((ttime.tv_sec-epochStart.tv_sec)*1e9 + (ttime.tv_nsec-epochStart.tv_nsec) >= 1e9*RUNTIME) {
+					//printf("epoch %llu done \n", epochNumber);
+					epochNumber++;
+					break;
+				}
+			}
+			
 
 			#if SHARED_CQ
 				struct ibv_wc wc[connPerThread*2*ctx->rx_depth];
@@ -1603,62 +1860,94 @@ void* threadfunc(void* x) {
 				else if (wrID >= 0 && wrID < ctx->rx_depth) {
 
 					//printf("recv complete ... rcnt = %llu \n", ctx->rcnt);
+					if(((uint8_t)ctx->buf_recv[wrID][0] >> 4) & 0x01 == 1) {
+						countPriority[thread_id][connID]++;
+						//printf("connID = %llu , qpn = %llu \n", connID, wc[i].qp_num);
+						//printf("found valid pkt to measure diff \n");
+						//handling userspace sequence number
+						/*
+						if(expectedSeqNum[connID] != (uint8_t)ctx->buf_recv[wrID][12]) {
+							printf("conn %llu ... received sequence %llu ... expected %llu \n", connID, (uint8_t)ctx->buf_recv[wrID][12], expectedSeqNum[connID]);
+							//outOfOrderNum[connID]++;
+						}
+						else //printf("conn %llu ... received sequence %llu = expected %llu \n", connID, (uint8_t)ctx->buf_recv[wrID][12], expectedSeqNum[connID]);
 
-					countPriority[thread_id][connID]++;
-					//printf("connID = %llu , qpn = %llu \n", connID, wc[i].qp_num);
+						if(expectedSeqNum[connID] == 255) expectedSeqNum[connID] = 0;
+						else expectedSeqNum[connID]++;
+						*/
+						//handling userspace sequence number
 
-					//handling userspace sequence number
-					/*
-					if(expectedSeqNum[connID] != (uint8_t)ctx->buf_recv[wrID][12]) {
-						printf("conn %llu ... received sequence %llu ... expected %llu \n", connID, (uint8_t)ctx->buf_recv[wrID][12], expectedSeqNum[connID]);
-						//outOfOrderNum[connID]++;
-					}
-					else //printf("conn %llu ... received sequence %llu = expected %llu \n", connID, (uint8_t)ctx->buf_recv[wrID][12], expectedSeqNum[connID]);
-
-					if(expectedSeqNum[connID] == 255) expectedSeqNum[connID] = 0;
-					else expectedSeqNum[connID]++;
-					*/
-					//handling userspace sequence number
-
-
+						#if MEASURE_LATENCIES_ON_CLIENT						
+						if(rcnt > 10000) {
 
 							egressTS =  ((uint8_t)ctx->buf_recv[wrID][5] << 24) + ((uint8_t)ctx->buf_recv[wrID][6] << 16) + ((uint8_t)ctx->buf_recv[wrID][7] << 8) + ((uint8_t)ctx->buf_recv[wrID][8]);
 							ingressTS = ((uint8_t)ctx->buf_recv[wrID][1] << 24) + ((uint8_t)ctx->buf_recv[wrID][2] << 16) + ((uint8_t)ctx->buf_recv[wrID][3] << 8) + ((uint8_t)ctx->buf_recv[wrID][4]);
 
+							//if((uint8_t)ctx->buf_recv[wrID][9] >= numThreads) printf("coreid = %llu \n", (uint8_t)ctx->buf_recv[wrID][9]);
+							//assert((uint8_t)ctx->buf_recv[wrID][9] < numThreads);
+							
+							//whichcore[connID][receives[connID]] = (uint8_t)ctx->buf_recv[wrID][9];
+							//whichcore[connID][receives[connID]] = ((uint8_t)ctx->buf_recv[wrID][9] & 0xF0) >> 4;// (uint8_t)ctx->buf_recv[wrID][9];
+							whichcore[connID][receives[connID]] = (uint8_t)(((uint8_t)ctx->buf_recv[wrID][9] & 0xF0) >> 4);// (uint8_t)ctx->buf_recv[wrID][9];
+
+
+							uint64_t smallestCoreDepth = (((uint8_t)ctx->buf_recv[wrID][12] & 0x3F) << 8) + ((uint8_t)ctx->buf_recv[wrID][13]);
+							uint64_t largestCoreDepth = (((uint8_t)ctx->buf_recv[wrID][14] & 0x3F) << 8) + ((uint8_t)ctx->buf_recv[wrID][15]);
 							//egressTS = (unsigned long *)strtoul(conn->buf_recv[bufID] + 46, NULL, 0);
 							
+							
+							if(((uint8_t)ctx->buf_recv[wrID][16] >> 7) & 0x01 == 1) {
+								tempCoreQD = (((uint8_t)ctx->buf_recv[wrID][16] & 0x3F) << 8) + ((uint8_t)ctx->buf_recv[wrID][17]);
+								whichQueueDepth[connID][receives[connID]] = tempCoreQD;
+								if(tempCoreQD > largestCoreQD) largestCoreQD = tempCoreQD;
+							}
+							else whichQueueDepth[connID][receives[connID]] = 65535;
+
+							//if(smallestCoreDepth != 0) printf("smallestCoreDepth = %llu \n", smallestCoreDepth);
+							//if(largestCoreDepth != 0) printf("largestCoreDepth = %llu \n", largestCoreDepth);
+							//assert(largestCoreDepth != smallestCoreDepth);
+							if(largestCoreDepth - smallestCoreDepth > largestCoreDepthDifference[thread_id]) largestCoreDepthDifference[thread_id] = largestCoreDepth - smallestCoreDepth;
+							whichMaxMinQueueDepthDiff[connID][receives[connID]] = largestCoreDepth - smallestCoreDepth;
+
 							if(egressTS > ingressTS) latency = egressTS - ingressTS;
 							else latency = /*4294967295*/ uint64_t(1099511627775) + (egressTS - ingressTS);
 
 							//printf("ingressTS = %llu, egressTS = %llu, latency = %llu \n", ingressTS, egressTS, latency);
 
-							#if MEASURE_LATENCIES_ON_CLIENT						
-							if(rcnt > 1000) {
-								//printf("priority = %llu \n", priorityID);
-								latencyArr[connID][receives[connID]] = latency;
-								//printf("wrote latency \n");
-								//if(receives[priorityID] < goalLoad*RUNTIME*numEpochs - 1) 
-								receives[connID]++;
 
-								#if debug						
-								if(conn->rcnt % INTERVAL == 0 && conn->rcnt > 0) {
-									double curr_clock = now();
-									printf("T%d - %f rps, rcnt = %d, scnt = %d \n",thread_num,INTERVAL/(curr_clock-prev_clock),conn->rcnt,conn->scnt);
-									prev_clock = curr_clock;
-								}
-								#endif
+							//printf("priority = %llu \n", priorityID);
+							latencyArr[connID][receives[connID]] = latency;
+							//printf("wrote latency \n");
+							clock_gettime(CLOCK_MONOTONIC,&curtime);
+
+							uint64_t elapsed = (curtime.tv_sec-realStart.tv_sec )/1e-9 + (curtime.tv_nsec-realStart.tv_nsec);
+							latencyArrTimestamp[connID][receives[connID]] = elapsed;
+
+
+							//printf("wrote latency timestamp \n");
+							//if(receives[priorityID] < numExpectedRequests - 1) 
+
+							#if debug						
+							if(conn->rcnt % INTERVAL == 0 && conn->rcnt > 0) {
+								double curr_clock = now();
+								printf("T%d - %f rps, rcnt = %d, scnt = %d \n",thread_num,INTERVAL/(curr_clock-prev_clock),conn->rcnt,conn->scnt);
+								prev_clock = curr_clock;
 							}
-
-							clock_gettime(CLOCK_MONOTONIC,&nowtime[rcnt]);
-							whichconn[rcnt] = connID;
-							//assert((uint8_t)connID == (uint8_t)thread_id);
-							whichcore[rcnt] = (uint8_t)ctx->buf_recv[wrID][9];
-							//assert((uint8_t)ctx->buf_recv[wrID][9] == 0 || (uint8_t)ctx->buf_recv[wrID][9] == 1 || (uint8_t)ctx->buf_recv[wrID][9] == 2 || (uint8_t)ctx->buf_recv[wrID][9] == 3);
 							#endif
 
+							//assert((uint8_t)connID == (uint8_t)thread_id);
+
+							receives[connID]++;
+							//assert((uint8_t)ctx->buf_recv[wrID][9] == 0 || (uint8_t)ctx->buf_recv[wrID][9] == 1 || (uint8_t)ctx->buf_recv[wrID][9] == 2 || (uint8_t)ctx->buf_recv[wrID][9] == 3);
+						}
+						#endif
+
+						rcnt++;
+						//assert(rcnt <= numExpectedRequestsPerThread);
+						//assert(ctx->rcnt <= numExpectedRequestsPerConnection);
+					}
 
 					ctx->rcnt++;
-					rcnt++;
 
 					assert(pp_post_recv(ctx, wrID) == 0);
 					if (ctx->routs < ctx->rx_depth) {
@@ -1692,16 +1981,17 @@ void* threadfunc(void* x) {
 
 	ctx = ctxs[offset];
 
-	float usec = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
+	float nsec = (ttime.tv_sec - realStart.tv_sec) * 1e9 + (ttime.tv_nsec - realStart.tv_nsec);
 	//long long bytes = (long long) size * iters * 2;
 		
 	all_rcnts[thread_id] = rcnt;
 	all_scnts[thread_id] = scnt;
 
-	rps[thread_id] = rcnt/(usec/1000000.);
-	printf("%d iters in %.5f seconds, rps = %f \n", rcnt, usec/1000000., rps[thread_id]);
+	rps[thread_id] = rcnt/(nsec/1000000000.);
+	printf("%d iters in %.5f seconds, rps = %f \n", rcnt, nsec/1000000000., rps[thread_id]);
 
-
+	printf("T%llu, largestCoreQD = %llu \n", thread_id, largestCoreQD);
+	
 	/*
 	uint64_t * countofPriorityAgain = (uint64_t*)malloc(numConnections*(sizeof(uint64_t)));
 	for(int o = 0; o < SERVICE_TIME_SIZE; o++) countofPriorityAgain[priorityID[o]]++;
@@ -1827,12 +2117,41 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	#if ENABLE_KERNEL
+	uint64_t sizeofArray = 3008;
+	uint64_t numIterations = 10000;
+	uint64_t numPartitions = 32;
+	//600*1024*8 = 4.6 MB
+	//2400*1024*8 = 18.75 MB
+	//3008*1024*8 = 18.75 MB
+
+	std::random_device rd1{};
+	std::mt19937 gen1{rd1()};
+	std::uniform_int_distribution<uint8_t>* rand1 = new std::uniform_int_distribution<uint8_t>(0, 255);
+
+	connArray = (uint64_t**)malloc(numConnections*sizeof(uint64_t*));
+
+	for(uint64_t cc = 0; cc < numConnections; cc++){
+		connArray[cc] = (uint64_t*)malloc(sizeofArray*sizeof(uint64_t));
+		for(uint64_t ccc = 0; ccc < sizeofArray; ccc++){
+			connArray[cc][ccc] = (*rand1)(gen1);
+		}
+	}
+	#endif
+
 	if (optind == argc - 1)
 		servername = strdupa(argv[optind]);
 	else if (optind < argc) {
 		usage(argv[0]);
 		return 1;
 	}
+	
+	ret = pthread_barrier_init(&barrier, &attr, numThreads);
+	assert(ret == 0);
+
+	//numExpectedRequestsPerThread = goalLoad*RUNTIME*numEpochs/numThreads;
+	if(numConnections > 1) numExpectedRequestsPerConnection = goalLoad*RUNTIME*numEpochs/(numConnections/2);// /numConnections
+	else numExpectedRequestsPerConnection = goalLoad*RUNTIME*numEpochs/(numConnections);
 
 	page_size = sysconf(_SC_PAGESIZE);
 
@@ -2010,44 +2329,95 @@ int main(int argc, char *argv[])
 		recvDistribution[i] = (uint64_t*)malloc(numConnections*sizeof(uint64_t));
 		for(int j = 0; j < numConnections; j++) recvDistribution[i][j] = 0;
 	}
-	
+
+	//allocating rcnt, scnt, souts
+	rcnt = (uint64_t *)malloc(numThreads*sizeof(uint64_t));
+	scnt = (uint64_t *)malloc(numThreads*sizeof(uint64_t));
+	souts = (uint64_t *)malloc(numThreads*sizeof(uint64_t));
+	largestCoreDepthDifference = (uint64_t *)malloc(numThreads*sizeof(uint64_t));
+
+	for(uint64_t bb = 0; bb < numThreads; bb++) {
+		rcnt[bb] = 0;
+		scnt[bb] = 0;
+		souts[bb] = 0;
+		largestCoreDepthDifference[bb] = 0;
+	}	
+
+	//printf("allocating latencies, size of latency = %llu \n", sizeof(uint64_t));
 	latencies = (uint64_t ***)malloc(numThreads*sizeof(uint64_t**));
+	size_t total_mem_allocated = 0;
 	for(uint64_t b = 0; b < numThreads; b++) {
+		//std::cout << "Allocating latencies[" << b << "]: " << numConnections * sizeof(uint64_t) << std::endl;
+		total_mem_allocated += numConnections * sizeof(uint64_t);
 		latencies[b] = (uint64_t**)malloc(numConnections*sizeof(uint64_t*));
 		for(uint64_t p = 0; p < numConnections; p++) {
-			latencies[b][p] = (uint64_t*)malloc(goalLoad*RUNTIME*numEpochs*sizeof(uint64_t));
-			for(uint64_t v = 0; v < goalLoad*RUNTIME*numEpochs; v++) {
+			//std::cout << "Allocating latencies[" << b << "][" << p << "]: " << numConnections * sizeof(uint64_t) << std::endl;
+			latencies[b][p] = (uint64_t*)malloc(numExpectedRequestsPerConnection*sizeof(uint64_t));
+			total_mem_allocated += numExpectedRequestsPerConnection*sizeof(uint64_t);
+			for(uint64_t v = 0; v < numExpectedRequestsPerConnection; v++) {
 				latencies[b][p][v] = 0;
 			}
 		}
-	}	
+	}
 
-	struct timespec **nowtime;
+	std::cout << "Interim total mem allocated (MiB): " << (total_mem_allocated / 1024 / 1024) << std::endl;
 
-	whichconn = (uint16_t **)malloc(numThreads*sizeof(uint16_t*));
+	//printf("allocating latencies timestamps, size of timestamp = %llu \n", sizeof(uint64_t));
+	latenciesTimestamp = (uint64_t ***)malloc(numThreads*sizeof(uint64_t **));
 	for(uint64_t b = 0; b < numThreads; b++) {
-		whichconn[b] = (uint16_t*)malloc(goalLoad*RUNTIME*numEpochs*sizeof(uint16_t));
-		for(uint64_t v = 0; v < goalLoad*RUNTIME*numEpochs; v++) {
-			whichconn[b][v] = 0;
+		latenciesTimestamp[b] = (uint64_t **)malloc(numConnections*sizeof(uint64_t *));
+		total_mem_allocated += numConnections * sizeof(uint64_t *);
+		for(uint64_t p = 0; p < numConnections; p++) {
+			latenciesTimestamp[b][p] = (uint64_t *)malloc(numExpectedRequestsPerConnection*sizeof(uint64_t));
+			total_mem_allocated += numExpectedRequestsPerConnection * sizeof(uint64_t);
+			for(uint64_t v = 0; v < numExpectedRequestsPerConnection; v++) {
+				latenciesTimestamp[b][p][v] = 0;
+			}
 		}
-	}	
+	}
+	printf("done allocating latencies timestamps \n");
 
-	whichcore = (uint16_t **)malloc(numThreads*sizeof(uint16_t*));
-	for(uint64_t b = 0; b < numThreads; b++) {
-		whichcore[b] = (uint16_t*)malloc(goalLoad*RUNTIME*numEpochs*sizeof(uint16_t));
-		for(uint64_t v = 0; v < goalLoad*RUNTIME*numEpochs; v++) {
-			whichcore[b][v] = 0;
+	whichcore = (uint8_t ***)malloc(numThreads*sizeof(uint8_t **));
+	for(uint8_t b = 0; b < numThreads; b++) {
+		whichcore[b] = (uint8_t **)malloc(numConnections*sizeof(uint8_t *));
+		total_mem_allocated += numConnections * sizeof(uint8_t *);
+		for(uint16_t p = 0; p < numConnections; p++) {
+			whichcore[b][p] = (uint8_t *)malloc(numExpectedRequestsPerConnection*sizeof(uint8_t));
+			total_mem_allocated += numExpectedRequestsPerConnection * sizeof(uint8_t);
+			for(uint64_t v = 0; v < numExpectedRequestsPerConnection; v++) {
+				whichcore[b][p][v] = 0;
+			}
 		}
-	}	
+	}
 
-	nowtime = (struct timespec **)malloc(numThreads*sizeof(struct timespec *));
-	for(uint64_t b = 0; b < numThreads; b++) {
-		nowtime[b] = (struct timespec *)malloc(goalLoad*RUNTIME*numEpochs*sizeof(struct timespec));
-		for(uint64_t v = 0; v < goalLoad*RUNTIME*numEpochs; v++) {
-				nowtime[b][v].tv_sec = 0;
-				nowtime[b][v].tv_nsec = 0;
+	whichQueueDepth = (uint16_t ***)malloc(numThreads*sizeof(uint16_t **));
+	for(uint16_t b = 0; b < numThreads; b++) {
+		whichQueueDepth[b] = (uint16_t **)malloc(numConnections*sizeof(uint16_t *));
+		total_mem_allocated += numConnections * sizeof(uint16_t *);
+		for(uint16_t p = 0; p < numConnections; p++) {
+			whichQueueDepth[b][p] = (uint16_t *)malloc(numExpectedRequestsPerConnection*sizeof(uint16_t));
+			total_mem_allocated += numExpectedRequestsPerConnection * sizeof(uint16_t);
+			for(uint64_t v = 0; v < numExpectedRequestsPerConnection; v++) {
+				whichQueueDepth[b][p][v] = 0;
+			}
 		}
-	}	
+	}
+
+	whichMaxMinQueueDepthDiff = (uint16_t ***)malloc(numThreads*sizeof(uint16_t **));
+	for(uint16_t b = 0; b < numThreads; b++) {
+		whichMaxMinQueueDepthDiff[b] = (uint16_t **)malloc(numConnections*sizeof(uint16_t *));
+		total_mem_allocated += numConnections * sizeof(uint16_t *);
+		for(uint16_t p = 0; p < numConnections; p++) {
+			whichMaxMinQueueDepthDiff[b][p] = (uint16_t *)malloc(numExpectedRequestsPerConnection*sizeof(uint16_t));
+			total_mem_allocated += numExpectedRequestsPerConnection * sizeof(uint16_t);
+			for(uint64_t v = 0; v < numExpectedRequestsPerConnection; v++) {
+				whichMaxMinQueueDepthDiff[b][p][v] = 0;
+			}
+		}
+	}
+
+
+	std::cout << "Final total mem allocated: " << (total_mem_allocated / 1024 / 1024) << std::endl;
 
 	#endif
 
@@ -2055,25 +2425,134 @@ int main(int argc, char *argv[])
 	std::random_device rd{};
 	std::mt19937 gen{rd()};
 
-	uint16_t numQueuesGettingMoreLoad = numConnections/5;
+	uint16_t numQueuesGettingMoreLoad;
 	std::uniform_int_distribution<uint64_t>* rand = new std::uniform_int_distribution<uint64_t>(0, numConnections-1);
 
-	// Generate unique numbers
-	while (uniqueNumbers20P.size() < numQueuesGettingMoreLoad) {
-		int num = (*rand)(gen);
-		uniqueNumbers20P.insert(num);  // Insert only if it's unique
-	}
 
-	numQueuesGettingMoreLoad = numConnections/10;
-	// Generate unique numbers
-	while (uniqueNumbers10P.size() < numQueuesGettingMoreLoad) {
-		int num = (*rand)(gen);
-		uniqueNumbers10P.insert(num);  // Insert only if it's unique
-	}
+	for(uint16_t e = 0; e < numEpochs; e++) {
 
+		if(priority_distribution_mode == FIFTYPRAND) {
+			numQueuesGettingMoreLoad = numConnections/2;
+			// Generate unique numbers
+			while (uniqueNumbers50P[e].size() < numQueuesGettingMoreLoad) {
+				int num = (*rand)(gen);
+				uniqueNumbers50P[e].insert(num);  // Insert only if it's unique
+			}
+		}
+		else if (priority_distribution_mode == TWENTYPRAND) {
+			numQueuesGettingMoreLoad = numConnections/5;
+			// Generate unique numbers
+			while (uniqueNumbers20P[e].size() < numQueuesGettingMoreLoad) {
+				int num = (*rand)(gen);
+				uniqueNumbers20P[e].insert(num);  // Insert only if it's unique
+			}
+			/*
+			for (auto it = uniqueNumbers20P[e].begin(); it != uniqueNumbers20P[e].end(); ++it) {
+				std::cout << *it << " ";
+			}
+			std::cout << std::endl;
+			*/
+		}
+		else if(priority_distribution_mode == TENPRAND) {
+			numQueuesGettingMoreLoad = numConnections/10;
+			// Generate unique numbers
+			while (uniqueNumbers10P[e].size() < numQueuesGettingMoreLoad) {
+				int num = (*rand)(gen);
+				uniqueNumbers10P[e].insert(num);  // Insert only if it's unique
+			}
+		}
+		else if(priority_distribution_mode == HUNDREDPRAND) {
+			numQueuesGettingMoreLoad = numConnections;
+			// Generate unique numbers
+			while (uniqueNumbers100P[e].size() < numQueuesGettingMoreLoad) {
+				int num = (*rand)(gen);
+				uniqueNumbers100P[e].insert(num);  // Insert only if it's unique
+			}
+		}
+		else if(priority_distribution_mode == MIXEDRAND) {
+
+			numQueuesGettingMoreLoad = numConnections/2;
+			// Generate unique numbers
+			while (uniqueNumbers50P[e].size() < numQueuesGettingMoreLoad) {
+				int num = (*rand)(gen);
+				uniqueNumbers50P[e].insert(num);  // Insert only if it's unique
+			}
+
+			numQueuesGettingMoreLoad = numConnections/5;
+			// Generate unique numbers
+			while (uniqueNumbers20P[e].size() < numQueuesGettingMoreLoad) {
+				int num = (*rand)(gen);
+				uniqueNumbers20P[e].insert(num);  // Insert only if it's unique
+			}
+
+			numQueuesGettingMoreLoad = numConnections/10;
+			// Generate unique numbers
+			while (uniqueNumbers10P[e].size() < numQueuesGettingMoreLoad) {
+				int num = (*rand)(gen);
+				uniqueNumbers10P[e].insert(num);  // Insert only if it's unique
+			}
+		
+			numQueuesGettingMoreLoad = numConnections;
+			// Generate unique numbers
+			while (uniqueNumbers100P[e].size() < numQueuesGettingMoreLoad) {
+				int num = (*rand)(gen);
+				uniqueNumbers100P[e].insert(num);  // Insert only if it's unique
+			}
+		}
+	}
 
 
 	do_uc(ib_devname, servername, port, ib_port, gidx, numConnections, numThreads);
+
+	#if ENABLE_KERNEL
+
+	//start timestamp
+	struct timespec starttimestamp, endtimestamp;
+	clock_gettime(CLOCK_MONOTONIC,&starttimestamp);
+
+	volatile uint64_t sum = 0;
+	for(uint64_t iter = 0; iter < numIterations; iter++){
+		
+		for(uint64_t index = 0; index < sizeofArray/numPartitions; index++){
+			sum = sum + connArray[10][index+(0*sizeofArray)/numPartitions] + connArray[10][index+(1*sizeofArray)/numPartitions] + connArray[10][index+(2*sizeofArray)/numPartitions] + connArray[10][index+(3*sizeofArray)/numPartitions] + 
+						connArray[10][index+(4*sizeofArray)/numPartitions] + connArray[10][index+(5*sizeofArray)/numPartitions] + connArray[10][index+(6*sizeofArray)/numPartitions] + connArray[10][index+(7*sizeofArray)/numPartitions] +
+						connArray[10][index+(8*sizeofArray)/numPartitions] + connArray[10][index+(9*sizeofArray)/numPartitions] + connArray[10][index+(10*sizeofArray)/numPartitions] + connArray[10][index+(11*sizeofArray)/numPartitions] + 
+						connArray[10][index+(12*sizeofArray)/numPartitions] + connArray[10][index+(13*sizeofArray)/numPartitions] + connArray[10][index+(14*sizeofArray)/numPartitions] + connArray[10][index+(15*sizeofArray)/numPartitions] +
+						connArray[10][index+(16*sizeofArray)/numPartitions] + connArray[10][index+(17*sizeofArray)/numPartitions] + connArray[10][index+(18*sizeofArray)/numPartitions] + connArray[10][index+(19*sizeofArray)/numPartitions] + 
+						connArray[10][index+(20*sizeofArray)/numPartitions] + connArray[10][index+(21*sizeofArray)/numPartitions] + connArray[10][index+(22*sizeofArray)/numPartitions] + connArray[10][index+(23*sizeofArray)/numPartitions] +
+						connArray[10][index+(24*sizeofArray)/numPartitions] + connArray[10][index+(25*sizeofArray)/numPartitions] + connArray[10][index+(26*sizeofArray)/numPartitions] + connArray[10][index+(27*sizeofArray)/numPartitions] + 
+						connArray[10][index+(28*sizeofArray)/numPartitions] + connArray[10][index+(29*sizeofArray)/numPartitions] + connArray[10][index+(30*sizeofArray)/numPartitions] + connArray[10][index+(31*sizeofArray)/numPartitions];
+		}
+		
+		/*
+		for(uint64_t cc = 0; cc < numConnections; cc++){
+			for(uint64_t index = 0; index < sizeofArray/numPartitions; index++){
+				//sum = sum + connArray[cc][index];
+				sum = sum + connArray[cc][index+(0*sizeofArray)/numPartitions] + connArray[cc][index+(1*sizeofArray)/numPartitions] + connArray[cc][index+(2*sizeofArray)/numPartitions] + connArray[cc][index+(3*sizeofArray)/numPartitions] + 
+						connArray[cc][index+(4*sizeofArray)/numPartitions] + connArray[cc][index+(5*sizeofArray)/numPartitions] + connArray[cc][index+(6*sizeofArray)/numPartitions] + connArray[cc][index+(7*sizeofArray)/numPartitions] +
+						connArray[cc][index+(8*sizeofArray)/numPartitions] + connArray[cc][index+(9*sizeofArray)/numPartitions] + connArray[cc][index+(10*sizeofArray)/numPartitions] + connArray[cc][index+(11*sizeofArray)/numPartitions] + 
+						connArray[cc][index+(12*sizeofArray)/numPartitions] + connArray[cc][index+(13*sizeofArray)/numPartitions] + connArray[cc][index+(14*sizeofArray)/numPartitions] + connArray[cc][index+(15*sizeofArray)/numPartitions] +
+						connArray[cc][index+(16*sizeofArray)/numPartitions] + connArray[cc][index+(17*sizeofArray)/numPartitions] + connArray[cc][index+(18*sizeofArray)/numPartitions] + connArray[cc][index+(19*sizeofArray)/numPartitions] + 
+						connArray[cc][index+(20*sizeofArray)/numPartitions] + connArray[cc][index+(21*sizeofArray)/numPartitions] + connArray[cc][index+(22*sizeofArray)/numPartitions] + connArray[cc][index+(23*sizeofArray)/numPartitions] +
+						connArray[cc][index+(24*sizeofArray)/numPartitions] + connArray[cc][index+(25*sizeofArray)/numPartitions] + connArray[cc][index+(26*sizeofArray)/numPartitions] + connArray[cc][index+(27*sizeofArray)/numPartitions] + 
+						connArray[cc][index+(28*sizeofArray)/numPartitions] + connArray[cc][index+(29*sizeofArray)/numPartitions] + connArray[cc][index+(30*sizeofArray)/numPartitions] + connArray[cc][index+(31*sizeofArray)/numPartitions];// +
+			}
+		}
+		*/
+	}
+
+	//end timestamp
+	clock_gettime(CLOCK_MONOTONIC,&endtimestamp);
+
+	printf("end sec = %llu, end ns = %llu, start sec = %llu, start ns = %llu \n", endtimestamp.tv_sec, endtimestamp.tv_nsec, starttimestamp.tv_sec, starttimestamp.tv_nsec);
+	float elapsedTime = (endtimestamp.tv_sec-starttimestamp.tv_sec)*1e9 + (endtimestamp.tv_nsec-starttimestamp.tv_nsec);
+	
+	printf("elapsedTime = %f \n", elapsedTime/numIterations);
+	//printf("elapsedTime = %f \n", elapsedTime/(numIterations*numConnections));
+
+	sleep(10);
+	#endif
+
 
 	//if(servername == NULL) numThreads = 1;
     for(int x = 0; x < numThreads; x++) {
@@ -2084,10 +2563,14 @@ int main(int argc, char *argv[])
 
 		#if MEASURE_LATENCIES_ON_CLIENT
 		tdata->latencyArr = latencies[x];
+		tdata->latencyArrTimestamp = latenciesTimestamp[x];
 		tdata->receives = recvDistribution[x];
-		tdata->whichconn = whichconn[x];
 		tdata->whichcore = whichcore[x];
-		tdata->nowtime = nowtime[x];
+		tdata->whichQueueDepth = whichQueueDepth[x];
+		tdata->whichMaxMinQueueDepthDiff = whichMaxMinQueueDepthDiff[x];
+		tdata->rcnt = rcnt[x];
+		tdata->scnt = scnt[x];		
+		tdata->souts = souts[x];
 		#endif
 
 		ret = pthread_create(&pt[x], NULL, threadfunc, tdata); 
@@ -2099,6 +2582,13 @@ int main(int argc, char *argv[])
         int ret = pthread_join(pt[x], NULL);
         assert(!ret);
     }
+
+	uint64_t largestCoreDepthGap = 0;
+	for(int g = 0; g < numThreads; g++) {
+		if(largestCoreDepthDifference[g] > largestCoreDepthGap) largestCoreDepthGap = largestCoreDepthDifference[g];
+	}
+	printf("largestCoreDepthDifference = %llu \n", largestCoreDepthGap);
+
 
 	uint32_t total_rcnt = 0;
 	uint32_t total_scnt = 0;
@@ -2165,178 +2655,66 @@ int main(int argc, char *argv[])
 	
 	#if MEASURE_LATENCIES_ON_CLIENT
 	char* output_name_all;
-	char* output_name_time;
+	char* output_name_all_timestamps;
 	char* output_name_conn;
 	char* output_name_core;
+	char* output_name_qd;
+	char* output_name_diffqd;
 
-	char* output_name_time1;
-	char* output_name_conn1;
-	char* output_name_core1;
+	asprintf(&output_name_all, "%s/all_%d_%d_conn.result", output_dir, (int)totalRPS, numConnections);
+	asprintf(&output_name_all_timestamps, "%s/all_%d_%d_conn.timestamps", output_dir, (int)totalRPS, numConnections);
+	asprintf(&output_name_conn, "%s/all_%d_%d_conn.conn", output_dir, (int)totalRPS, numConnections);
+	asprintf(&output_name_core, "%s/all_%d_%d_conn.core", output_dir, (int)totalRPS, numConnections);
+	asprintf(&output_name_qd, "%s/all_%d_%d_conn.qd", output_dir, (int)totalRPS, numConnections);
+	asprintf(&output_name_diffqd, "%s/all_%d_%d_conn.diffqd", output_dir, (int)totalRPS, numConnections);
 
-	if(priority_distribution_mode == FB) 	  {
-		asprintf(&output_name_all, "%s/all_%d_%d_conn_FB.result", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time, "%s/all_%d_%d_conn_FB.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn, "%s/all_%d_%d_conn_FB.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core, "%s/all_%d_%d_conn_FB.core", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time1, "%s/all_%d_%d_conn_FB_1.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn1, "%s/all_%d_%d_conn_FB_1.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core1, "%s/all_%d_%d_conn_FB_1.core", output_dir, (int)totalRPS, numConnections);
-	}
-	else if(priority_distribution_mode == PC) {
-		asprintf(&output_name_all, "%s/all_%d_%d_conn_PC.result", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time, "%s/all_%d_%d_conn_PC.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn, "%s/all_%d_%d_conn_PC.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core, "%s/all_%d_%d_conn_PC.core", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time1, "%s/all_%d_%d_conn_PC_1.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn1, "%s/all_%d_%d_conn_PC_1.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core1, "%s/all_%d_%d_conn_PC_1.core", output_dir, (int)totalRPS, numConnections);
-	}
-	else if(priority_distribution_mode == SQ) {
-		asprintf(&output_name_all, "%s/all_%d_%d_conn_SQ.result", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time, "%s/all_%d_%d_conn_SQ.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn, "%s/all_%d_%d_conn_SQ.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core, "%s/all_%d_%d_conn_SQ.core", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time1, "%s/all_%d_%d_conn_SQ_1.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn1, "%s/all_%d_%d_conn_SQ_1.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core1, "%s/all_%d_%d_conn_SQ_1.core", output_dir, (int)totalRPS, numConnections);
-	}
-	else if(priority_distribution_mode == CONTWENTYP) {
-		asprintf(&output_name_all, "%s/all_%d_%d_conn_CONTWENTYP.result", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time, "%s/all_%d_%d_conn_CONTWENTYP.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn, "%s/all_%d_%d_conn_CONTWENTYP.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core, "%s/all_%d_%d_conn_CONTWENTYP.core", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time1, "%s/all_%d_%d_conn_CONTWENTYP_1.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn1, "%s/all_%d_%d_conn_CONTWENTYP_1.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core1, "%s/all_%d_%d_conn_CONTWENTYP_1.core", output_dir, (int)totalRPS, numConnections);
-	}
-	else if(priority_distribution_mode == CONTENP) {
-		asprintf(&output_name_all, "%s/all_%d_%d_conn_CONTENP.result", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time, "%s/all_%d_%d_conn_CONTENP.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn, "%s/all_%d_%d_conn_CONTENP.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core, "%s/all_%d_%d_conn_CONTENP.core", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time1, "%s/all_%d_%d_conn_CONTENP_1.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn1, "%s/all_%d_%d_conn_CONTENP_1.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core1, "%s/all_%d_%d_conn_CONTENP_1.core", output_dir, (int)totalRPS, numConnections);
-	}
-	else if(priority_distribution_mode == CONFIFTYP) {
-		asprintf(&output_name_all, "%s/all_%d_%d_conn_CONFIFTYP.result", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time, "%s/all_%d_%d_conn_CONFIFTYP.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn, "%s/all_%d_%d_conn_CONFIFTYP.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core, "%s/all_%d_%d_conn_CONFIFTYP.core", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time1, "%s/all_%d_%d_conn_CONFIFTYP_1.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn1, "%s/all_%d_%d_conn_CONFIFTYP_1.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core1, "%s/all_%d_%d_conn_CONFIFTYP_1.core", output_dir, (int)totalRPS, numConnections);
-	}
-	else if(priority_distribution_mode == MIXED) {
-		asprintf(&output_name_all, "%s/all_%d_%d_conn_MIXED.result", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time, "%s/all_%d_%d_conn_MIXED.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn, "%s/all_%d_%d_conn_MIXED.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core, "%s/all_%d_%d_conn_MIXED.core", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time1, "%s/all_%d_%d_conn_MIXED_1.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn1, "%s/all_%d_%d_conn_MIXED_1.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core1, "%s/all_%d_%d_conn_MIXED_1.core", output_dir, (int)totalRPS, numConnections);
-	}
-	else if(priority_distribution_mode == TWENTYPRAND) {
-		asprintf(&output_name_all, "%s/all_%d_%d_conn_TWENTYPRAND.result", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time, "%s/all_%d_%d_conn_TWENTYPRAND.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn, "%s/all_%d_%d_conn_TWENTYPRAND.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core, "%s/all_%d_%d_conn_TWENTYPRAND.core", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time1, "%s/all_%d_%d_conn_TWENTYPRAND_1.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn1, "%s/all_%d_%d_conn_TWENTYPRAND_1.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core1, "%s/all_%d_%d_conn_TWENTYPRAND_1.core", output_dir, (int)totalRPS, numConnections);
-	}
-	else if(priority_distribution_mode == TENPRAND) {
-		asprintf(&output_name_all, "%s/all_%d_%d_conn_TENPRAND.result", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time, "%s/all_%d_%d_conn_TENPRAND.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn, "%s/all_%d_%d_conn_TENPRAND.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core, "%s/all_%d_%d_conn_TENPRAND.core", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_time1, "%s/all_%d_%d_conn_TENPRAND_1.time", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_conn1, "%s/all_%d_%d_conn_TENPRAND_1.conn", output_dir, (int)totalRPS, numConnections);
-		asprintf(&output_name_core1, "%s/all_%d_%d_conn_TENPRAND_1.core", output_dir, (int)totalRPS, numConnections);
-	}
-	else assert(false);
-	
 	FILE *f_all = fopen(output_name_all, "wb");
-	FILE *f_time = fopen(output_name_time, "wb");
+	FILE *f_all_timestamps = fopen(output_name_all_timestamps, "wb");
 	FILE *f_conn = fopen(output_name_conn, "wb");
 	FILE *f_core = fopen(output_name_core, "wb");
+	FILE *f_qd = fopen(output_name_qd, "wb");
+	FILE *f_diffqd = fopen(output_name_diffqd, "wb");
 
-	FILE *f_time1 = fopen(output_name_time1, "wb");
-	FILE *f_conn1 = fopen(output_name_conn1, "wb");
-	FILE *f_core1 = fopen(output_name_core1, "wb");
 
-	
 	uint64_t countedLatencyZero = 0;
 	printf("dumping latencies ... \n");
 	for(uint i = 0; i < numConnections; i++){
-
-		//char* output_name;
-		//asprintf(&output_name, "%s/%d_%d.result", output_dir, i, (int)totalRPS);
-		//FILE *f = fopen(output_name, "wb");
-
-		for(uint j = 0; j < numThreads; j++) {
-			uint64_t index = 0;
+		for(uint8_t j = 0; j < numThreads; j++) {
 			//while(latencies[j][i][index] > 0) {
-			for(uint index = 0; index < recvDistribution[j][i]; index++) {
-				if(latencies[j][i][index] == 0) {
+			for(uint64_t index = 0; index < recvDistribution[j][i]; index++) {
+				if(latencies[j][i][index] == 0 || latenciesTimestamp[j][i][index] == 0 || latenciesTimestamp[j][i][index] > 2*numEpochs*RUNTIME*1e9) {
 					countedLatencyZero++;
 					continue;
 				}
 				//fprintf(f, "%llu \n", latencies[j][i][index]);
 				fprintf(f_all, "%llu \n", latencies[j][i][index]);
+				fprintf(f_all_timestamps, "%llu \n", latenciesTimestamp[j][i][index]);
+				fprintf(f_conn, "%llu \n", i);
+
+				//if(whichcore[j][i][index] >= numThreads) printf("coreid = %llu \n", whichcore[j][i][index]);
+				assert(whichcore[j][i][index] < numThreads);
+				fprintf(f_core, "%llu \n", whichcore[j][i][index]);
+
+				//if(whichQueueDepth[j][i][index] >= 16384) printf("qd = %llu \n", whichQueueDepth[j][i][index]);
+				//assert(whichQueueDepth[j][i][index] < 16384);
+				fprintf(f_qd, "%llu \n", whichQueueDepth[j][i][index]);
+				//index++;
+
+				//if(whichMaxMinQueueDepthDiff[j][i][index] > 0) printf("diff qd = %llu \n", whichMaxMinQueueDepthDiff[j][i][index]);
+				//assert(whichMaxMinQueueDepthDiff[j][i][index] < 65535);
+				fprintf(f_diffqd, "%llu \n", whichMaxMinQueueDepthDiff[j][i][index]);
 				//index++;
 			}
 		}
 		//fclose(f);
 	}
-	fclose(f_all);
 	printf("count of zero latency = %llu \n",countedLatencyZero);
-	
-	uint64_t* numReqCompletedInEachSecond = (uint64_t*)malloc(2*numEpochs*RUNTIME*sizeof(uint64_t));
-	for(int zz = 0; zz < 2*numEpochs*RUNTIME ; zz++) numReqCompletedInEachSecond[zz] = 0;
-	uint64_t one_second_in_ns = 1000000000;  // 1 second = 1,000,000,000 nanoseconds
-	//printf("hello \n");
-
-	for(uint j = 0; j < numThreads; j++) {
-		for(uint index = 0; index < goalLoad*RUNTIME*numEpochs; index++) {
-			//printf("index = %llu \n", index);
-			if(nowtime[j][index].tv_nsec == 0 && nowtime[j][index].tv_sec == 0) {
-				continue;
-			}
-			uint64_t time_elapsed = (nowtime[j][index].tv_sec - starttime.tv_sec)/1e-9 + (nowtime[j][index].tv_nsec - starttime.tv_nsec);
-			//assert(time_elapsed < 12e9);
-			//assert(whichconn[j][index] == j);
-
-			if(j == 0) {
-				fprintf(f_time, "%llu \n", time_elapsed);
-				fprintf(f_conn, "%llu \n", whichconn[j][index]);
-				fprintf(f_core, "%llu \n", whichcore[j][index]);
-			}
-			else if(j == 1) {
-				fprintf(f_time1, "%llu \n", time_elapsed);
-				fprintf(f_conn1, "%llu \n", whichconn[j][index]);
-				fprintf(f_core1, "%llu \n", whichcore[j][index]);
-			}
-			//else assert(false);
-
-			//printf("%llu \n",time_elapsed/one_second_in_ns);
-			//if(time_elapsed/one_second_in_ns > numEpochs*RUNTIME) {
-			//	numReqCompletedInEachSecond[numEpochs*RUNTIME - 1]++;
-			//}
-			//else 
-			numReqCompletedInEachSecond[time_elapsed/one_second_in_ns]++;
-		}
-	}
-
-	for(int zz = 0; zz < 2*numEpochs*RUNTIME ; zz++) printf("%llu \n", numReqCompletedInEachSecond[zz]);
-
-	fclose(f_time);
+	fclose(f_all);
+	fclose(f_all_timestamps);
 	fclose(f_conn);
 	fclose(f_core);
-
-	fclose(f_time1);
-	fclose(f_conn1);
-	fclose(f_core1);
+	fclose(f_qd);
+	fclose(f_diffqd);
 	#endif
 	
 	

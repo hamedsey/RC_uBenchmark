@@ -663,6 +663,7 @@ static int connect_qp(struct resources *res) {
 
     //sock_sync_data(res->sock, sizeof(struct cm_con_data_t),(char *)&local_con_data, (char *)&tmp_con_data);
     if (config.server_name) { //client
+        sleep(1);
         int socket_desc;
         socket_desc = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         assert(socket_desc >= 0);
@@ -974,7 +975,7 @@ int do_uc(char *dev_name, char *server_name, uint32_t tcp_port, int ib_port, int
     config.gid_idx = gid_idx;
     config.server_name = server_name;
     
-    sleep(1);
+    //if (config.server_name) sleep(1);
 
     print_config();
 

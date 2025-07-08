@@ -66,34 +66,62 @@
 #include <infiniband/verbs.h>
 #include <linux/types.h>  //for __be32 type
 #include <errno.h>
+#include <algorithm>
+#include <random>
 
 #include "rdma_uc.cc"
+#include <x86intrin.h> // For __rdtsc()
 
-//#include <algorithm>
-//#include <random>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <poll.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <array>
+
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <unistd.h>
+
 #define SERVICE_TIME_SIZE 0x8000
 
 #define MAX_QUEUES 1024
-#define SHARED_CQ 1
+#define SHARED_CQ 0
 #define RC 1
 #define ENABLE_SERV_TIME 1
-#define FPGA_NOTIFICATION 0
+#define FPGA_NOTIFICATION 1
 #define debugFPGA 0
 #define bitVector 1
 
 #define SHARE_SHAREDCQs 0
 
+#define NOTIFICATION_QUEUE 0
+
+#define CONN_AFFINITY_OVERHEAD 0
+
+#define ENABLE_KERNEL 0
+
+#define RUNTIME 45 //115
+
+#define USE_EVENT 0
+#define IB 0
+
+//const std::string energy_path = "/sys/class/powercap/intel-rapl:0/energy_uj";
+
+
 struct ibv_device      **dev_list;
 struct ibv_device	*ib_dev;
 char                    *ib_devname = NULL;
 char                    *servername = NULL;
-unsigned int             port = 18515;
+unsigned int             port = 18511;
 int                      ib_port = 1;
 unsigned int             size = 4096;
 enum ibv_mtu		 	 mtu = IBV_MTU_1024;
 uint64_t             rx_depth = 8192;
 uint64_t             iters = 1000;
-int                      num_cq_events = 0;
+//int                      num_cq_events = 0;
 int                      sl = 0;
 int			 gidx = -1;
 char			 gid[33];
@@ -115,6 +143,15 @@ uint8_t *expectedSeqNum;
 struct ibv_cq **sharedCQ;
 #endif
 
+#if ENABLE_KERNEL
+uint64_t **connArray;
+uint64_t sizeofArray = 3008; //125; //3008, 125; //size to 1000 and do loop multiple times
+uint64_t numIterations = 1;  //45; // 1, 45
+uint64_t numPartitions = 32;
+#endif 
+
+uint64_t *elapsedTime;
+char* output_dir;
 
 uint64_t gen_arrival_time(uint64_t *arrivalSleepTime) {
     
@@ -213,6 +250,7 @@ struct pingpong_context {
     volatile char *buf_write;                 // memory buffer pointer, used for
 };
 struct ibv_context	*globalcontext;
+struct ibv_comp_channel *channel;
 
 struct pingpong_context **ctx;
 
@@ -220,6 +258,48 @@ struct thread_data {
 	struct pingpong_context **ctxs;
 	uint64_t thread_id;
 };
+
+std::string execCommand(const char* cmd) {
+    std::array<char, 128> buffer;
+    std::string result;
+
+    // Open the command for reading.
+    FILE* pipe = popen(cmd, "r");
+    if (!pipe) {
+        throw std::runtime_error("popen() failed!");
+    }
+
+    // Read the output into a string.
+    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+        result += buffer.data();
+    }
+
+    // Close the pipe.
+    int returnCode = pclose(pipe);
+    if (returnCode != 0) {
+        printf("Command exited with non-zero status: %d \n", returnCode);
+		exit(EXIT_FAILURE);
+    }
+
+    return result;
+}
+
+uint64_t readEnergyUj() {
+    std::string output = execCommand("cat /sys/class/powercap/intel-rapl:0:0/energy_uj");
+    return std::stoull(output);
+}
+
+double read_energy_uj(const std::string& path) {
+    std::ifstream file(path);
+    double energy = 0.0;
+    if (file.is_open()) {
+        file >> energy;
+        file.close();
+    } else {
+        std::cerr << "Failed to open energy file: " << path << std::endl;
+    }
+    return energy;
+}
 
 void my_sleep(uint64_t n) {
 	//if(n == 10000) printf("mysleep = %llu \n",n);
@@ -231,6 +311,7 @@ void my_sleep(uint64_t n) {
 		uint64_t elapsed = (curtime.tv_sec-ttime.tv_sec )/1e-9 + (curtime.tv_nsec-ttime.tv_nsec);
 
 		if (elapsed >= n) {
+			assert(elapsed >= n);
 			//printf("elapsed = %llu \n",elapsed);
 			break;
 		}
@@ -553,11 +634,31 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 				ibv_get_device_name(ib_dev));
 			goto clean_buffer;
 		}
+
+		#if USE_EVENT
+			#if IB
+			channel = ibv_create_comp_channel(globalcontext);
+			if (!channel) {
+				fprintf(stderr, "Couldn't create completion channel\n");
+				goto clean_device;
+			}
+			#endif
+		#else
+			channel = NULL;
+		#endif
 	}
 	ctx->context = globalcontext;
 	ctx->id = poo;
 
-	ctx->channel = NULL;
+	#if USE_EVENT
+		#if !IB
+		ctx->channel = ibv_create_comp_channel(ctx->context);
+		if (!ctx->channel) {
+			fprintf(stderr, "Couldn't create completion channel\n");
+			goto clean_device;
+		}
+		#endif
+	#endif
 
 	ctx->pd = ibv_alloc_pd(ctx->context);
 	if (!ctx->pd) {
@@ -588,9 +689,17 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 				fprintf(stderr, "Couldn't create CQ\n");
 				goto clean_cq;
 			}
-		}
+		} 
 	#else
-		ctx->cq = ibv_create_cq(ctx->context, 2*rx_depth + 1, NULL, ctx->channel, 0);
+		#if USE_EVENT
+			#if IB
+			ctx->cq = ibv_create_cq(ctx->context, 2*rx_depth + 1, ctx, channel, 0);
+			#else		
+			ctx->cq = ibv_create_cq(ctx->context, 2*rx_depth + 1, NULL, ctx->channel, 0);
+			#endif
+		#else 
+			ctx->cq = ibv_create_cq(ctx->context, 2*rx_depth + 1, NULL, ctx->channel, 0);
+		#endif
 		if (!ctx->cq) {
 			fprintf(stderr, "Couldn't create CQ\n");
 			goto clean_mr;
@@ -874,7 +983,6 @@ static void usage(const char *argv0)
 
 void* threadfunc(void* x) {
 	//printf("hello \n");
-	struct timeval           start, end;
 	struct thread_data *tdata = (struct thread_data *)x;
 	struct pingpong_context **ctxs = (struct pingpong_context **)(tdata->ctxs);
 	uint64_t thread_id = tdata->thread_id;
@@ -889,9 +997,21 @@ void* threadfunc(void* x) {
 	struct pingpong_context *ctx = ctxs[0];
 	//OFFSET IS THE CONNECTION ID
 
+	#if USE_EVENT
+	struct ibv_wc wc[rx_depth*2];
+	#else 
 	struct ibv_wc wc[1];
+	#endif
+	struct ibv_wc wc_drain[rx_depth*2];
+
+	#if NOTIFICATION_QUEUE
+	struct ibv_wc wc_notif[1];
+	int ne_notif, i_notif;
+	uint64_t wrID_notif;
+	struct pingpong_context *ctx_noti = ctxs[1];
+	#endif
 	
-	int ne, i;
+	int ne, i, ne_drain;
 
 	//printf("ctx->id = %llu \n", ctxs[thread_id]->id);
 	cpu_set_t cpuset;
@@ -921,6 +1041,7 @@ void* threadfunc(void* x) {
 	uint64_t mean = (uint64_t)2E3;
 	uint64_t sleep_time = 1000;
 	uint64_t foundEmptyQueue = 0;
+	uint64_t prevOffset = 0;
 
 	#if FPGA_NOTIFICATION
 		/*
@@ -954,7 +1075,6 @@ void* threadfunc(void* x) {
 		//uint64_t endOffset = startOffset + numConnections;
 		//uint64_t leftOff = startOffset;
 
-		uint64_t prevOffset = 0;
 		uint64_t notificationExistsButNoPacket = 0;
 		uint64_t idlePollsBeforeFindingWork = 0;
 		//bool haveNotPolled = true;
@@ -972,260 +1092,189 @@ void* threadfunc(void* x) {
 		ctx = ctxs[prevOffset];
 	#endif
 
-	if (gettimeofday(&start, NULL)) {
-		perror("gettimeofday");
-		return 0;
-	}
-
 	uint16_t signalInterval = (8192 - ctx->rx_depth)/4;
 	printf("signalInterval = %llu \n", signalInterval);
 
 	uint64_t connection8Active = 0;
 	uint64_t connection9Active = 0;
 
+	struct timespec start, end;
+	clock_gettime(CLOCK_MONOTONIC,&start);
+	
+	struct timespec starttimestamp, endtimestamp;	
+
+	//uint64_t num_cq_events = 0;
+
 #if SHARE_SHAREDCQs
 	uint64_t sharedCQIndex = thread_id;
 #endif
 
-	while (1) { //exit == false) {
+#if USE_EVENT
+	
+	int rc;
+	int ms_timeout = 10;
+	struct ibv_cq *ev_cq = NULL;
+	void *ev_ctx = NULL;
+	
+	#if !IB
+		//poll
+		/*
+		struct pollfd *my_pollfd;
+		my_pollfd = (struct pollfd *)malloc(numConnections* sizeof(struct pollfd));
+	
+		for(int i = 0; i < numConnections; i++) {
+			my_pollfd[i].fd      = ctxs[i]->channel->fd;
+			my_pollfd[i].events  = POLLIN;
+		}
+		*/
+	
+		//epoll
+		
+		int epfd = epoll_create1(0);
+		struct epoll_event ev;
+		struct epoll_event *events;
+		//int *fds;
+		//ev = (struct epoll_event *)malloc(numConnections* sizeof(struct epoll_event));
+		events = (struct epoll_event *)malloc(numConnections* sizeof(struct epoll_event));
 
-			//my_sleep(uint64_t(3E2)); //647kRPS
 
-			//alliterations++;
-			if (gettimeofday(&end, NULL)) {
-				perror("gettimeofday");
-				return 0;
+		// Register each FD with epoll
+		for (int i = 0; i < numConnections; i++) {
+			ev.events = EPOLLIN;
+			ev.data.ptr = ctxs[i];//(void*)(ctxs[i]->channel->fd);
+			//ev.data.fd = ctxs[i]->channel->fd;
+			if (epoll_ctl(epfd, EPOLL_CTL_ADD, ctxs[i]->channel->fd, &ev) < 0) {
+				perror("epoll_ctl");
+				exit(EXIT_FAILURE);
 			}
+		}
+		
+	#endif
+	
+
+#endif
+	//double energy_end, energy_start;
+    //if(thread_id == 0) energy_start = read_energy_uj(energy_path);
+
+	while (1) { //exit == false) {
+			//sleep(RUNTIME);
+			//rcnt = 1;
+			clock_gettime(CLOCK_MONOTONIC,&end);
 
 			//runtime
-			if(end.tv_sec - start.tv_sec > 10) {
+			if(end.tv_sec - start.tv_sec > RUNTIME) {
 				//printf("finished 10 seconds \n");	
-				//exit = true;
 				break;
 			}
 
-			#if !SHARED_CQ && !FPGA_NOTIFICATION
+			//printf("offset = %llu \n", offset);
+
+			#if !SHARED_CQ && !FPGA_NOTIFICATION && !NOTIFICATION_QUEUE && !USE_EVENT
 			if(servername == NULL) {
 				ctx = ctxs[offset];
 			}
 			#endif
 
-			
-			//for(uint64_t y = 0; y < 4 ; y++) printf("%x  ", (res.buf)[y]);
-			//printf("\n\n");
-
 			#if FPGA_NOTIFICATION
 			/////////////////////////////////Multi Queue - lzcnt //////////////////////////////////////////////
 			foundWork = false;
 
-			//for (int i = 0; i < endOffset; i += 8) {
-			#if bitVector
-			//ii+=8;
 			if(ii*8 >= numConnections) { //compare against upperbound for numConnections*8 to make code identical
 				ii = 0;
-				//if(numConnections > 512) __asm__ __volatile__ ("clflush (%0)" :: "r"(res.buf));
 			}
-			#else
-			//ii+=8;
-			if(ii >= numConnections) ii = 0;
-			//rewrite code for byte vector like bit vector
-			/*
-			if(numConnections > 64 && (ii & 0x0000003F) == 0 && ii < numConnections - 64 ) {
-				__asm__ __volatile__ ("clflush (%0)" :: "r"(res.buf + ii));
-				//printf("invalidated cache line. ii = %llu \n", ii);
-			}
-			*/
-			#endif
-				
+
 			unsigned long long value = htonll(*reinterpret_cast<volatile unsigned long long*>(res.buf + ii + (4096*thread_id)));
-						
-			//printf("ii = %llu \n", ii);
-			//printf("T %llu = %llu \n", ii);
-			//if(value == 0xC000000000000000) printf("T%llu \n", thread_id);
-				
-			//bool bothareone = false;
-			//if((uint8_t)res.buf[0] == 128 && (uint8_t)res.buf[4096] == 128) bothareone = true;
-			//printf("thread %llu - bothareone = true \n", thread_id);
-			//assert(bothareone == true);
 
-			//printf("T%llu: 
-			//for(int pp = 0; pp < numConnections; pp++)
-			
-			//if((uint8_t)res.buf[(4096*thread_id)] != 0) printf("T%llu: %llu \n",thread_id, (uint8_t)res.buf[(4096*thread_id)]);
-			//if( ((uint8_t)res.buf[4096] == 255 && (uint8_t)res.buf[0] == 255) || ((uint8_t)res.buf[4097] == 255 && (uint8_t)res.buf[1] == 255)) {
-			//	printf("hi \n");
-			//	assert(false);
-			//}
-
-
-			#if FPGA_NOTIFICATION
 			while(value != 0) {
-			#endif
 
 			__asm__ __volatile__ ("lzcnt %1, %0" : "=r" (leadingZeros) : "r" (value):);  //register allocated
-			//__asm__ __volatile__ ("clflush (%0)" :: "r"(res.buf));
-
-			//the reason the gap does not exist is that the expensive operation of getting the cache block from memory is the same for both bit and byte vector
-			//128 queues
 			
-			//Byte vector 128 byte (two cache blocks)
-				//fetch from memory, bring into cache, 4x instructions + 4x instructions
-			//Bit vector 128 bits (one cache block)
-				//fetch from memory, bring into cache, x instructions
-			//both access one "slow" cache block
-			//if we invalidate the cache block that's not being changed we'd expect the gap to grow between bit/byte vector
-
-			//leadingZeros = __builtin_clzll(value);
-
-			//my_sleep(uint64_t(3E2)); //656kRPS
-			//if(uint8_t(res.buf[8]) == 0xFF) connection8Active++;
-			//if(uint8_t(res.buf[9]) == 0xFF) connection9Active++;
-			
-			#if bitVector
 			//printf("ii = %llu , value = %llu, leadingzeros = %llu \n", ii, (uint64_t)value, leadingZeros);
 			value = value & (uint64_t)(0x7FFFFFFFFFFFFFFF >> leadingZeros);
-			//uint64_t shiftStartValue = 0x7FFFFFFFFFFFFFFF;
 
-			//int result;
-
-			 // Right shift 'shiftStartValue' by 'leadingZeros'
-			 // Output: shiftStartValue is updated after the shift
-			 // Input: leadingZeros specifies how much to shift
-
-			/*
-			__asm__ __volatile__ (
-				"shr %[leadingZeros], %[shiftStartValue]"  
-				: [shiftStartValue] "+r" (shiftStartValue)         
-				: [leadingZeros] "r" ((uint8_t)leadingZeros) 
-			);
-			*/
-
-
-			/*
-			__asm__ __volatile__ (
-				"mov %[leadingZeros], %%cl;"  				// Move shift amount to 'cl'
-				"shr %%cl, %[shiftStartValue]"         		// Shift 'shiftStartValue' right by the amount in 'cl'
-				: [shiftStartValue] "=r" (shiftStartValue)      		// Output: result after the shift
-				: "[shiftStartValue]" (shiftStartValue),    // Input: shiftStartValue to shift
-				[leadingZeros] "r" (leadingZeros) 			// Input: shift amount
-				: "%cl"                      				// cl is modified, so we need to mention it here
-			);
-			*/
-			// Inline assembly block
-			// Shift 'shiftStartValue' right by 'leadingZeros', shiftStartValue = shiftStartValue >> leadingZeros
-			// Perform 'value = value & shiftStartValue'
-			// Output: result is stored back in 'value'
-			// Input: shiftStartValue that will be used as the mask after the shift
-			// Input: leadingZeros
-			/*
-			__asm__ __volatile__ (
-				"shr %[leadingZeros], %[shiftStartValue];"   
-				"and %[shiftStartValue], %[value];"         
-				: [value] "+r" (value)           			
-				: [shiftStartValue] "r" (shiftStartValue),  
-				[leadingZeros] "r" (leadingZeros) 			
-			);
-			*/
-
-			//0x3FFFFFFFFFFFFFFF
-			//0x1FFFFFFFFFFFFFFF
-			//0x0FFFFFFFFFFFFFFF
-			//if(leadingZeros != 64) {
-				offset = (ii << 3) + leadingZeros;
-
-				foundWork = true;
-				//printf("offset = %llu \n", offset);
-				//if(prevOffset != offset) {
-					ctx = ctxs[offset];
-				//	prevOffset = offset;
-					//printf("hi \n");
-				//}
-			//}
-			/*
-			else {
-				//printf("assert \n");
-				assert(true);
-				//ii = ii+8;//%numConnections;
-				//foundWork = false;
-				//no_work_found_idle_polls++;
-				continue;
-			}
-			*/
-			#else
-
-			//printf("ii = %llu, leading zeros = %llu \n", ii, leadingZeros);
-			/*
-			if(leadingZeros != 64) {
-			//if(uint8_t(res.buf[0]) == 255) {
-				offset = ii + (leadingZeros >> 3);// - startOffset; //this value will change depending on leading zeros
-				//printf("i is %llu \n", i);
-				//printf("startOffset is %llu \n", startOffset);
-				//printf("offset is %llu \n", offset);
-			
-				//my_sleep(uint64_t(3E2)); //648kRPS
-
-				foundWork = true;
-				counting++;
-				ii = ii+(leadingZeros >> 3)+1;//%numConnections;
-				//printf("thread %d - found work, offset is %llu \n", thread_id , offset);
-
-				ctx = ctxs[offset];
-
-				//leftOff = offset + startOffset+ 1;
-				//if(leftOff >= endOffset) leftOff = startOffset;
-				
-				//break;
-			}
-			else {
-				//my_sleep(sleep_time);  //backing off for 1ns
-				//usleep(1);
-				//my_sleep(uint64_t(3E2)); //444RPS
-				ii = ii+8;//%numConnections;
-				foundWork = false;
-				no_work_found_idle_polls++;
-				continue;
-			}
-			*/
-
-			
-			//printf("ii = %llu , value = %llu, leadingzeros = %llu \n", ii, (uint64_t)value, leadingZeros);
-
-			value = value & (uint64_t)(0x00FFFFFFFFFFFFFF >> leadingZeros);
-			offset = ii + (leadingZeros >> 3);// - startOffset; //this value will change depending on leading zeros
+			offset = (ii << 3) + leadingZeros;
 
 			foundWork = true;
-			//printf("thread %d - found work, offset is %llu \n", thread_id , offset);
 
 			ctx = ctxs[offset];
-			
 
-
-			assert(foundWork == true);
-			#endif
 			#endif
 
-			//printf("after lzcnt for loop \n");
+
+			#if USE_EVENT
 			
-			//CPU doesn't see update value... add prints or cut the statements in the code
-			//if using bits instead of bytes, need to use a bit mask to check the next queue in that read byte which has work (read 8 byte value once only)
+			// The following code will be called each time you need to read a Work Completion
+			
+			
+			// poll the channel until it has an event and sleep ms_timeout
+			// milliseconds between any iteration
 
-			//my_sleep(uint64_t(3E2)); //245RPS, 213kRPS
+			#if !IB
+			
+			//poll
+			/*
+			for(int i = 0; i < numConnections; i++) {
+				my_pollfd[i].revents = 0;
+			}
+			
+			do {
+				rc = poll(my_pollfd, numConnections, ms_timeout);
+			} while (rc == 0);
+			if (rc < 0) {
+				fprintf(stderr, "poll failed\n");
+				//return -1;
+			}
 
-		
-			//if(foundWork == false) {
-				/*
-				if(currentState == true) {
-					//printf("1 -> 0 \n");
-					currentState = false;
-				}
-				*/
-				//printf("did not find work \n");
-				//my_sleep(sleep_time);
+			if (rc > 0) {
+				for (int ccc = 0; ccc < numConnections; ccc++) {
+					if (my_pollfd[ccc].revents & POLLIN) {
+						// This fd is ready for reading
+						//printf("fd %d is ready to read\n", my_pollfd[i].fd);
+						ctx = ctxs[ccc];
+			
+			*/
+			//epoll
+			// Wait for events
+			
+			int nfds = epoll_wait(epfd, events, numConnections, -1);
+			if (nfds > 0) {
+				for (int i_epoll = 0; i_epoll < nfds; i_epoll++) {
+					if (uint32_t(events[i_epoll].events) & EPOLLIN) {
+						// This FD is ready to read
+						//ctx = ctxs[events[i].data.fd];
+						ctx = (struct pingpong_context *)(events[i_epoll].data.ptr);
 
-				//my_sleep(uint64_t(3E2)); //118RPS
-			//	continue;
+			ev_cq = ctx->cq;
+
+			#else
+			/* Wait for the completion event */
+
+			if (ibv_get_cq_event(channel, &ev_cq, &ev_ctx)) {
+				fprintf(stderr, "Failed to get cq_event\n");
+				//return 1;
+			}
+
+			struct pingpong_context *ctx = (struct pingpong_context *)ev_ctx;
+
+			//++num_cq_events;
+
+			//if (ev_cq != ctx->cq) {
+			//	fprintf(stderr, "CQ event for unknown CQ %p\n", ev_cq);
+				//return 1;
 			//}
 
+			/* Ack the event */	
+			ibv_ack_cq_events(ev_cq, 1);	
+
+			/* Request notification upon the next completion event */
+			if (ibv_req_notify_cq(ev_cq, 0)) {
+				fprintf(stderr, "Couldn't request CQ notification\n");
+				//return 1;
+			}
+			#endif
+			/* Empty the CQ: poll all of the completions from the CQ (if any exist) */
+
+			#endif
 
 			#if SHARED_CQ
 				//ne = ibv_poll_cq(sharedCQ[thread_id], connPerThread*2*ctx->rx_depth, wc);
@@ -1239,8 +1288,12 @@ void* threadfunc(void* x) {
 				#endif
 				//printf("after poll cq \n");
 			#else
-				//ne = ibv_poll_cq(ctx->cq, 2*ctx->rx_depth, wc);
+				#if USE_EVENT
+				ne = ibv_poll_cq(ev_cq, 2*ctx->rx_depth, wc);
+				//if(thread_id == 0) printf("offset = %llu \n", offset);
+				#else
 				ne = ibv_poll_cq(ctx->cq, 1, wc);
+				#endif
 			#endif
 
 			//printf("after polling \n");
@@ -1253,6 +1306,12 @@ void* threadfunc(void* x) {
 				fprintf(stderr, "poll CQ failed %d\n", ne);
 				return 0;
 			}
+			#if NOTIFICATION_QUEUE
+			if(ne == 0) {
+				foundEmptyQueue++;
+				while(ne == 0) ne = ibv_poll_cq(ctx->cq, 1, wc);
+			}
+			#endif
 
 			#if FPGA_NOTIFICATION
 			if(foundWork == true && ne == 0) lzcntsaysworkbutactuallynotthere++;
@@ -1271,6 +1330,11 @@ void* threadfunc(void* x) {
 					ctx = ctxs[offset];
 				#endif
 
+				#if CONN_AFFINITY_OVERHEAD
+					if(prevOffset != offset) my_sleep(1E2);
+					prevOffset = offset;
+				#endif
+
 				if(wrID == ctx->rx_depth) {
 					//++ctx->scnt;
 					//scnt++;
@@ -1278,10 +1342,7 @@ void* threadfunc(void* x) {
 					//my_sleep(uint64_t(3E2)); //75RPS
 				}
 				else if (wrID >= 0 && wrID < ctx->rx_depth) {
-
-					ctx->rcnt++;
-					rcnt++;
-
+					//if(thread_id == 0) printf("found work, offset = %llu \n", offset);
 					#if FPGA_NOTIFICATION
 						//received = true;
 						//printf("thread %d - found work in first poll, offset is %llu \n", thread_id , offset);
@@ -1292,17 +1353,14 @@ void* threadfunc(void* x) {
 						#endif
 					#endif
 
-					#if SHARED_CQ
-						countPriority[thread_id][offset]++;
-					#else
-						countPriority[thread_id][offset]++;
-					#endif
-					//uint8_t sleep_int_lower = (uint8_t)ctx->buf_recv[wrID][11];
-					//uint8_t sleep_int_upper = (uint8_t)ctx->buf_recv[wrID][10];	
-					//printf("recv complete ... rcnt = %llu \n", ctx->rcnt);
-
 					if(servername == NULL) {
 						sleep_time = ((uint8_t)ctx->buf_recv[wrID][11] + (uint8_t)ctx->buf_recv[wrID][10] * 0x100) << 4;
+						//assert(sleep_time == 992);
+						//sleep_time = 992;
+						#if NOTIFICATION_QUEUE
+						if(ctx->id == 0) assert(sleep_time == 992);
+						else if(ctx->id == 1) assert(sleep_time == 0);
+						#endif
 						//my_sleep((uint64_t)2E3);
 
 						/*
@@ -1312,17 +1370,87 @@ void* threadfunc(void* x) {
 						}
 						*/
 
-						if ((uint8_t)ctx->buf_recv[wrID][0] >= 128) foundEmptyQueue++; //printf("T%llu - conn %llu is empty \n", thread_id, offset);
+						//if ((uint8_t)ctx->buf_recv[wrID][0] >= 128) foundEmptyQueue++; //printf("T%llu - conn %llu is empty \n", thread_id, offset);
 
 					
 						#if ENABLE_SERV_TIME
 						//printf("sleep_time = %llu \n",sleep_time);
 						//printf("sleep_int_lower = %llu \n",(uint8_t)ctx->buf_recv[wrID][11]);
 						//printf("sleep_int_upper = %llu \n",(uint8_t)ctx->buf_recv[wrID][10]);
-						assert(sleep_time == 992);
+						#if NOTIFICATION_QUEUE
+						//if(offset == 0) assert(sleep_time == 992);
+						//else assert(sleep_time == 0);
 						my_sleep(sleep_time);
+						#else
+						//my_sleep(992);
+						
+						#if ENABLE_KERNEL
+						clock_gettime(CLOCK_MONOTONIC,&starttimestamp);
+						volatile uint64_t sum = 0;
+							
+						for(uint64_t index = 0; index < sizeofArray; index+=16) {
+							
+							// 2120 for sharedcq, 2900, 3000 for bitvector
+							
+							sum = sum + connArray[offset][index]++ + connArray[offset][index+1]++ + connArray[offset][index+2]++ + connArray[offset][index+3]++ +
+										connArray[offset][index+4]++ + connArray[offset][index+5]++ + connArray[offset][index+6]++ + connArray[offset][index+7]++ +
+										connArray[offset][index+8]++ + connArray[offset][index+9]++ + connArray[offset][index+10]++ + connArray[offset][index+11]++ +
+										connArray[offset][index+12]++ + connArray[offset][index+13]++ + connArray[offset][index+14]++ + connArray[offset][index+15]++;
+							
+							//1570 for sharedcq, 2000 for bitvector
+							/*
+							sum = sum + connArray[offset][index] + connArray[offset][index+1] + connArray[offset][index+2] + connArray[offset][index+3] +
+										connArray[offset][index+4] + connArray[offset][index+5] + connArray[offset][index+6] + connArray[offset][index+7] +
+										connArray[offset][index+8] + connArray[offset][index+9] + connArray[offset][index+10] + connArray[offset][index+11] +
+										connArray[offset][index+12] + connArray[offset][index+13] + connArray[offset][index+14] + connArray[offset][index+15];
+							*/
+						}
+						clock_gettime(CLOCK_MONOTONIC,&endtimestamp);
+
+						//assert((uint8_t)ctx->buf_recv[wrID][0] & 0x01 == 0);
+						//printf("char = %llu",(uint8_t)ctx->buf_recv[wrID][0] & 0x10);
+
+						//printf("elapsedTime = %f \n", elapsedTime/(numIterations*numConnections));
+						#else		
+						clock_gettime(CLOCK_MONOTONIC,&starttimestamp);	
+						//uint64_t startTS = __rdtsc();
+						my_sleep(sleep_time);
+						//uint64_t endTS = __rdtsc(); // Read CPU clock cycles at end
+						clock_gettime(CLOCK_MONOTONIC,&endtimestamp);
+						//printf("%llu \n", (endtimestamp.tv_sec-starttimestamp.tv_sec)*1e9 + (endtimestamp.tv_nsec-starttimestamp.tv_nsec));
+
+						#endif
+
+						#endif
+						ctx->buf_recv[wrID][9] = (((uint8_t)thread_id << 4) & 0xF0) + ((uint8_t)ctx->buf_recv[wrID][9] & 0x0F);          
 						memcpy(ctx->buf_send,ctx->buf_recv[wrID],size);
 						#endif
+
+						if(((uint8_t)ctx->buf_recv[wrID][0] >> 4) & 0x01 == 1) {
+							//printf("hello! ");
+
+							rcnt++;
+
+							#if SHARED_CQ
+								countPriority[thread_id][offset]++;
+							#else
+								countPriority[thread_id][offset]++;
+							#endif
+							//uint8_t sleep_int_lower = (uint8_t)ctx->buf_recv[wrID][11];
+							//uint8_t sleep_int_upper = (uint8_t)ctx->buf_recv[wrID][10];	
+							//printf("recv complete ... rcnt = %llu \n", ctx->rcnt);
+							
+							//elapsedTime[thread_id] = elapsedTime[thread_id] + (endTS - startTS);
+							elapsedTime[thread_id] = elapsedTime[thread_id] + ((endtimestamp.tv_sec-starttimestamp.tv_sec)*1e9 + (endtimestamp.tv_nsec-starttimestamp.tv_nsec));
+
+							//uint64_t smallestCoreDepth = ((uint8_t)ctx->buf_recv[wrID][12] << 8) + ((uint8_t)ctx->buf_recv[wrID][13]);
+							//uint64_t largestCoreDepth = ((uint8_t)ctx->buf_recv[wrID][14] << 8) + ((uint8_t)ctx->buf_recv[wrID][15]);
+							//assert(smallestCoreDepth == 0);
+							//assert(largestCoreDepth == 0);
+
+							//if(rcnt % 1000 == 0) printf("readEnergyUj() = %llu \n", readEnergyUj());
+						}
+
 					}
 
 					assert(pp_post_recv(ctx, wrID) == 0);
@@ -1349,8 +1477,19 @@ void* threadfunc(void* x) {
 
 					//for(int hi = 0; hi < 1; hi++) {
 						//if(offset == 0) {
+							/*
+							#if !FPGA_NOTIFICATION
+								ctx->buf_recv[wrID][9] = (uint8_t)thread_id;
+							#else 
+								assert((uint8_t)ctx->buf_recv[wrID][9] < numThreads);
+								if((uint8_t)ctx->buf_recv[wrID][9] != (uint8_t)thread_id) threadMismatch++; //printf("mismatch ... FPGA said thread %llu, thread id = %llu \n", (uint8_t)ctx->buf_recv[wrID][9], (uint8_t)thread_id);
+								ctx->buf_recv[wrID][9] = (((uint8_t)thread_id << 4) & 0xF0) + (uint8_t)ctx->buf_recv[wrID][9] & 0x0F;          
+							#endif
+							*/
+						
 							uint64_t success = pp_post_send(ctx, (ctx->scnt%signalInterval == 0));
-							assert(success == 0);
+							//assert(success == 0);
+							//printf("sent pkt reply \n");
 						//}
 						/*
 						if (success == EINVAL) printf("Invalid value provided in wr \n");
@@ -1369,6 +1508,58 @@ void* threadfunc(void* x) {
 						ctx->scnt++;
 						//my_sleep(uint64_t(3E2)); //635kRPS
 					//}
+
+					//uncomment to drain queue after reading queue depth from packet
+					/*
+					if(((uint8_t)ctx->buf_recv[wrID][16] >> 7) & 0x01 == 1) {
+						uint16_t tempCoreQD = (((uint8_t)ctx->buf_recv[wrID][16] & 0x3F) << 8) + ((uint8_t)ctx->buf_recv[wrID][17]);
+						//if(tempCoreQD > 64) printf("coreID = %llu,  tempCoreQD = %llu \n", thread_id, tempCoreQD);
+						assert(tempCoreQD < 65);
+						if(tempCoreQD > 55) {
+							ne_drain = ibv_poll_cq(sharedCQ[thread_id], tempCoreQD*2, wc_drain);
+							printf("coreID = %llu,  QD = %llu,  ne_drain = %llu \n", thread_id, tempCoreQD, ne_drain);
+
+							for (int d = 0; d < ne_drain; ++d) {
+								if (wc_drain[d].status != IBV_WC_SUCCESS) {
+									fprintf(stderr, "Failed status %s (%d) for wr_id %d\n", ibv_wc_status_str(wc_drain[d].status),wc_drain[d].status, (int) wc_drain[d].wr_id);
+									return 0;
+								}
+								wrID = (uint64_t) wc_drain[d].wr_id;
+
+								#if SHARED_CQ
+									uint64_t offset = wc_drain[d].qp_num & (MAX_QUEUES-1);
+									//printf("offset = %llu , qpn = %llu \n", offset, wc[i].qp_num);
+									ctx = ctxs[offset];
+								#endif
+
+								#if CONN_AFFINITY_OVERHEAD
+									if(prevOffset != offset) my_sleep(1E2);
+									prevOffset = offset;
+								#endif
+
+								if(wrID == ctx->rx_depth) {
+								}
+								else if (wrID >= 0 && wrID < ctx->rx_depth) {
+									if(((uint8_t)ctx->buf_recv[wrID][0] >> 4) & 0x01 == 1) {
+										//printf("hello! ");
+										rcnt++;
+										countPriority[thread_id][offset]++;
+									}
+
+									assert(pp_post_recv(ctx, wrID) == 0);
+									if (ctx->routs < ctx->rx_depth) {
+										fprintf(stderr,
+											"Couldn't post receive (%d)\n", ctx->routs);
+										return 0;
+									}
+
+									uint64_t success = pp_post_send(ctx, (ctx->scnt%signalInterval == 0));
+									assert(success == 0);
+								}
+							}
+						}
+					}
+					*/
 				}
 				else {
 					fprintf(stderr, "Completion for unknown wr_id %d\n",(int) wc[i].wr_id);
@@ -1376,11 +1567,18 @@ void* threadfunc(void* x) {
 				}
 			}
 
-			#if !SHARED_CQ && !FPGA_NOTIFICATION		
+			#if !SHARED_CQ && !FPGA_NOTIFICATION && !NOTIFICATION_QUEUE && !USE_EVENT
 			if(servername == NULL) {
-				if(offset == numConnections-1) offset = 0;
-				else offset++;
-
+			
+				//if(thread_id < 6) {
+					if(offset == numConnections-1) offset = 0;
+					else offset++;
+				//}
+				//else {
+				//	if(offset == 0) offset = numConnections-1;
+				//	else offset--;
+				//}
+				
 				//if(offset == ((numConnections/numThreads) * (thread_id+1)) -1) offset = (numConnections/numThreads) * thread_id;
 				//else offset++;
 				
@@ -1394,27 +1592,47 @@ void* threadfunc(void* x) {
 			//if(ii >= numConnections) ii = 0;
 			
 			#endif
+
+		#if USE_EVENT
+		#if !IB
+					}
+			}
+		}
+		#endif
+		#endif
 	}
 
+	//if(thread_id == 0) energy_end = read_energy_uj(energy_path);
+
+	elapsedTime[thread_id] = elapsedTime[thread_id]/rcnt;
+	
 	ctx = ctxs[offset];
 
-	float usec = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
+	float nsec = (end.tv_sec - start.tv_sec) * 1000000000 + (end.tv_nsec - start.tv_nsec);
 	//long long bytes = (long long) size * iters * 2;
 		
 	all_rcnts[thread_id] = rcnt;
 	all_scnts[thread_id] = scnt;
 
-	rps[thread_id] = rcnt/(usec/1000000.);
+	rps[thread_id] = rcnt/(nsec/1000000000.);
 	#if FPGA_NOTIFICATION
-	printf("T %d, %d iters in %.5f seconds, rps = %f ..... notificationExistsButNoPacket = %llu , idlePollsBeforeFindingWork = %llu \n", thread_id, rcnt, usec/1000000., rps[thread_id],notificationExistsButNoPacket, idlePollsBeforeFindingWork);
+	printf("T %d, %d iters in %.5f seconds, rps = %f ..... notificationExistsButNoPacket = %llu , idlePollsBeforeFindingWork = %llu \n", thread_id, rcnt, nsec/1000000000., rps[thread_id],notificationExistsButNoPacket, idlePollsBeforeFindingWork);
 	#else
-	printf("T %d, %d iters in %.5f seconds, rps = %f  \n", thread_id, rcnt, usec/1000000., rps[thread_id]);
+	printf("T %d, %d iters in %.5f seconds, rps = %f  \n", thread_id, rcnt, nsec/1000000000., rps[thread_id]);
 	#endif
 	
 	printf("T%llu found an empty queue %llu times \n", thread_id, foundEmptyQueue);
 	//printf("connection 8 active = %llu \n", connection8Active);
 	//printf("connection 9 active = %llu \n", connection9Active);
 
+	printf("hi %llu \n");
+
+	/*
+	if(thread_id == 0)  {
+		double energy_diff_joules = (energy_end - energy_start) / 1e6;
+		printf("Power = %f Watts (J/s) \n", energy_diff_joules/(nsec/1000000000.));
+	}
+	*/
 	/*
 	//printf("\n\nprinting sequence number stats \n.\n.\n.\n");
 	uint64_t totalOutOfOrderNum = 0;
@@ -1457,15 +1675,14 @@ int main(int argc, char *argv[])
 			{ .name = "mtu",      .has_arg = 1, .flag = NULL, .val = 'm' },
 			{ .name = "rx-depth", .has_arg = 1, .flag = NULL, .val = 'r' },
 			{ .name = "iters",    .has_arg = 1, .flag = NULL, .val = 'n' },
-			{ .name = "load",     .has_arg = 1, .flag = NULL, .val = 'l' },
+			{ .name = "goalLoad",     .has_arg = 1, .flag = NULL, .val = 'l' },
 			{ .name = "events",   .has_arg = 0, .flag = NULL, .val = 'e' },
 			{ .name = "gid-idx",  .has_arg = 1, .flag = NULL, .val = 'g' },
-			{ .name = "chk",      .has_arg = 0, .flag = NULL, .val = 'c' },
-			{ .name = "num-threads", .has_arg = 1, .flag = NULL, .val = 't' },
+			{ .name = "numthreads", .has_arg = 1, .flag = NULL, .val = 't' },
 			{}
 		};
 
-		c = getopt_long(argc, argv, "p:d:i:s:m:r:n:l:eg:c:t:",
+		c = getopt_long(argc, argv, "p:d:i:s:m:r:n:l:eg:c:t:k:f:",
 				long_options, NULL);
 		if (c == -1)
 			break;
@@ -1515,11 +1732,38 @@ int main(int argc, char *argv[])
 			numThreads = strtoul(optarg, NULL, 0);
 			break;
 
+		case 'f':
+        	output_dir = optarg;
+        	break;
+			 
 		default:
 			usage(argv[0]);
 			return 1;
 		}
 	}
+
+	//600*1024*8 = 4.6 MB
+	//2400*1024*8 = 18.75 MB
+	//3008*1024*8 = 18.75 MB
+
+	//std::random_device rd1{};
+	//std::mt19937 gen1{rd1()};
+	//std::uniform_int_distribution<uint8_t>* rand1 = new std::uniform_int_distribution<uint8_t>(0, 255);
+
+	#if ENABLE_KERNEL
+	printf("size of conn context = %llu \n", sizeof(struct pingpong_context));
+	connArray = (uint64_t**)malloc(numConnections*sizeof(uint64_t*));
+
+	for(uint64_t cc = 0; cc < numConnections; cc++){
+		connArray[cc] = (uint64_t*)malloc(sizeofArray*sizeof(uint64_t));
+		for(uint64_t ccc = 0; ccc < sizeofArray; ccc++){
+			connArray[cc][ccc] = 10;
+		}
+	}
+	#endif
+
+	elapsedTime = (uint64_t*)malloc(numThreads*sizeof(uint64_t));
+	for(int g = 0; g < numThreads; g++) elapsedTime[g] = 0;
 
 	if (optind == argc - 1)
 		servername = strdupa(argv[optind]);
@@ -1584,7 +1828,36 @@ int main(int argc, char *argv[])
 			assert(pp_post_recv(ctx[y], z) == 0);
 			//printf("hello 3 \n");
 			ctx[y]->routs++;
+			//printf("bubu \n");
 		}
+
+		//printf("bubu \n");
+
+		#if USE_EVENT
+		if (ibv_req_notify_cq(ctx[y]->cq, 0)) {
+			fprintf(stderr, "Couldn't request CQ notification\n");
+			return 1;
+		}
+		//printf("hello bubu \n");
+
+		#if !IB
+		int flags;
+		int ret;
+		int rc;
+		// The following code will be called only once, after the Completion Event Channel was created
+		//printf("Changing the mode of Completion events to be read in non-blocking\n");
+		//printf("hello fufu \n");
+		// change the blocking mode of the completion channel 
+
+		flags = fcntl(ctx[y]->channel->fd, F_GETFL,0);
+		rc = 	fcntl(ctx[y]->channel->fd, F_SETFL, flags | O_NONBLOCK);
+		if (rc < 0) {
+				fprintf(stderr, "Failed to change file descriptor of Completion Event Channel\n");
+				return -1;
+		}
+		#endif
+		#endif 
+
 		//printf("hello 2222 \n");
 
 		if (ctx[y]->routs < ctx[y]->rx_depth) {
@@ -1702,6 +1975,23 @@ int main(int argc, char *argv[])
         int ret = pthread_join(pt[x], NULL);
         assert(!ret);
     }
+
+	//#if ENABLE_KERNEL
+	float avgKernelServiceTime = 0.0;
+	for(int g = 0; g < numThreads; g++) {
+		printf("elapsedTime = %llu\n", elapsedTime[g]);
+		avgKernelServiceTime += elapsedTime[g];
+	}
+	printf("avgKernelServiceTime = %f\n", avgKernelServiceTime/numThreads);
+
+	char* output_name_avgServiceTime;
+	asprintf(&output_name_avgServiceTime, "%s/avg_service_time.servtime", output_dir);
+	FILE *f_avgServiceTime = fopen(output_name_avgServiceTime, "wb");
+	fprintf(f_avgServiceTime, "%f \n", avgKernelServiceTime/numThreads);
+	fclose(f_avgServiceTime);
+
+	//sleep(10);
+	//#endif
 
 	uint32_t total_rcnt = 0;
 	uint32_t total_scnt = 0;
