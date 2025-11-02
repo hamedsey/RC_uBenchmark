@@ -1,6 +1,6 @@
 #!/bin/bash
 
-sudo /etc/init.d/openibd restart
+#sudo /etc/init.d/openibd restart
 sudo modprobe mlx_accel_tools
 sudo mst start --with_fpga
 sudo /./opt/Xilinx/Vivado/2016.2/bin/hw_serverpv

@@ -54,6 +54,14 @@ BRAM = [3.1, 3.2, 3.2]
 LUT = [4.2, 6.9, 11.3]
 FF = [0.1, 0.1, 0.1]
 
+result_array = [7.3, 10.1, 14.5]
+
+BRAM = [3.166394399, 3.166394399, 3.196266044]
+LUT = [4.093452612,	6.902839362, 11.32612472]
+FF = [0.084929664,	0.105142292, 0.146488072]
+
+result_array = [7.1, 10.0, 14.4]
+
 print(BRAM)
 print(LUT)
 print(FF)
@@ -66,7 +74,6 @@ print(BRAM)
 print(LUT)
 print(FF)
 
-result_array = [7.3, 10.1, 14.5]
 #result_array = [num/100 for num in result_array]
 
 ax.bar(conn, BRAM, label='BRAM', color ='orchid')
